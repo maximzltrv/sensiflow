@@ -1,0 +1,56 @@
+[project]
+name = "sensiflow"
+version = "0.1.0"
+description = "Propagate PII tags along data lineage and classify how exposed the PII is at each downstream data product."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Maksim Zolotarev", email = "maximzltrv@gmail.com" }]
+requires-python = ">=3.10"
+keywords = ["pii", "lineage", "data-governance", "openmetadata", "dbt", "sql"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database",
+    "Typing :: Typed",
+]
+dynamic = ["dependencies"]
+
+[project.scripts]
+sensiflow = "sensiflow.cli:main"
+
+[tool.poetry]
+packages = [{ include = "sensiflow", from = "src" }]
+
+[tool.poetry.dependencies]
+python = ">=3.10"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^9.1.1"
+ruff = "^0.16.1"
+mypy = "^2.3.0"
+
+[build-system]
+requires = ["poetry-core>=2.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.10"
+files = ["src", "tests"]
+strict = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
