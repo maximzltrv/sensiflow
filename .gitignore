@@ -13,6 +13,9 @@ venv/
 # Project is poetry-managed; ignore stray uv lock files
 uv.lock
 
+# Local working context (contains builder/portfolio notes — not for the public repo)
+PROJECT_CONTEXT.md
+
 # Tooling caches
 .pytest_cache/
 .mypy_cache/
