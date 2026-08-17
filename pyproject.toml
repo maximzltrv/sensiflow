@@ -29,6 +29,7 @@ packages = [{ include = "sensiflow", from = "src" }]
 
 [tool.poetry.dependencies]
 python = ">=3.10"
+sqlglot = "^30.17.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^9.1.1"
