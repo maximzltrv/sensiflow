@@ -15,6 +15,7 @@ uv.lock
 
 # Local working context (contains builder/portfolio notes — not for the public repo)
 PROJECT_CONTEXT.md
+CLAUDE.local.md
 
 # Tooling caches
 .pytest_cache/
