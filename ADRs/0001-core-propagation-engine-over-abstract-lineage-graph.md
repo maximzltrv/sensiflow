@@ -1,6 +1,7 @@
 # ADR-0001: Core propagation engine over an abstract lineage graph
 
-- **Status:** Accepted
+- **Status:** Accepted (amended 2026-09-15: added explicit applicability
+  preconditions)
 - **Date:** 2026-08-15
 - **Deciders:** Maksim Zolotarev
 
@@ -26,6 +27,37 @@ Forces shaping the design:
 5. **Mis-tagging is worse than under-tagging.** Column matching down a lineage
    graph is heuristic (mostly name-based), so results carry uncertainty and
    must never silently mutate the catalog.
+
+## Applicability preconditions (amendment, 2026-09-15)
+
+The tool is applicable **only when seed PII markup already exists at the root
+source nodes of the lineage graph** — the first point of lineage where PII
+originates. That markup can come from:
+
+- manual (or policy-driven) tagging in the catalog itself (e.g. OMD
+  `PII.Sensitive` tags), or
+- markup inherited/ingested from the metadata of operational databases
+  (PostgreSQL, MySQL, and similar OLTP systems that typically feed the
+  warehouse), where the catalog's ingestion carries those annotations in.
+
+Without seed markup at the origins the engine has nothing to propagate: every
+node classifies as `NONE` and the report is trivially empty. This is a
+precondition, not a failure mode — the tool must state it clearly in docs and,
+ideally, detect the "no seeds anywhere" case and say so in the report instead
+of printing a silently empty result.
+
+**This constraint is an initial-scope decision, not a permanent one.** Two
+planned feature branches relax it later (tracked in the project backlog):
+
+1. **Standalone PII declarations imported from a file** (e.g. CSV/YAML) — an
+   alternative seeding channel for catalogs that have lineage but no PII
+   markup; sensiflow maps the declared source columns onto the warehouse
+   schemas and propagates from there.
+2. **Automated markup toward a chosen legal standard** (regional or global:
+   GDPR, CCPA/CPRA, PDPL, ...) — a separate future direction where the tool
+   itself drives classification to a standard's definitions.
+
+Each of these gets its own ADR when scheduled.
 
 ## Decision
 
