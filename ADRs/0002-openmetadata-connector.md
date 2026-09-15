@@ -83,24 +83,36 @@ when `--source openmetadata` is requested — base install stays clean.
   list of one. This is the recommended, cheap path.
 - **`roots=None`**: paginate over all tables, then resolve lineage per table.
   Documented as potentially slow on large catalogs; fine for the demo tier.
-- **`max_depth`** (decided 2026-09-15): optional hop limit from the nearest
-  root, as a tuning knob for targeted investigation. `None` (default) walks
-  to the ends of the graph with cycle protection.
+- **`upstream_depth` / `downstream_depth`** (decided 2026-09-15, refined from
+  a single `max_depth`): two independent hop limits from the nearest root,
+  tuning knobs for targeted investigation. `None` (default) walks that
+  direction to the end of the graph with cycle protection; `0` disables that
+  direction entirely. Direction selection is thus expressed through depths
+  (upstream-only = `downstream_depth=0`, and vice versa) — no separate
+  direction switch, so no conflicting combinations. Maps 1:1 onto the OMD
+  lineage endpoint's own `upstreamDepth`/`downstreamDepth` parameters.
 
-**Warning obligation for truncated graphs.** A depth limit can cut the walk
-off *before reaching the PII origins* (per ADR-0001's applicability
-precondition, seeds usually live at the far upstream end). A truncated graph
-with no seeds inside the horizon classifies everything `NONE` — a false-clean
-report. Therefore whenever `max_depth` trimmed at least one edge AND no seed
-node made it into the graph, the connector/report must carry an explicit
-warning ("graph truncated at depth N; no PII sources within horizon —
-findings may be incomplete") rather than silently printing an empty result.
-This extends the "no seeds anywhere" reporting rule from ADR-0001.
+**Warning obligations for truncated graphs — the two directions differ:**
+
+- **Upstream truncation is dangerous.** Seeds usually live at the far
+  upstream end (ADR-0001 applicability precondition); cutting upstream can
+  exclude every PII origin, classifying everything `NONE` — a false-clean
+  report. Whenever the upstream limit trimmed at least one edge AND no seed
+  node made it into the graph, the report must carry an explicit warning
+  ("upstream truncated at depth N; no PII sources within horizon — findings
+  may be incomplete") rather than silently printing an empty result. This
+  extends the "no seeds anywhere" reporting rule from ADR-0001.
+- **Downstream truncation is coverage-limiting, not correctness-breaking:**
+  seeds and classification of the fetched nodes stay valid; consumers below
+  the horizon are simply not examined. A milder note suffices ("downstream
+  truncated at depth M — consumers below this horizon were not analyzed").
 
 Note: this changes the `LineageSource` protocol signature from
 `build_graph(root: str | None)` to
-`build_graph(roots: Sequence[str] | None = None, *, max_depth: int | None = None)`.
-`MockSource` accepts and ignores both (its graph is fixed). Acceptable now —
+`build_graph(roots: Sequence[str] | None = None, *,
+             upstream_depth: int | None = None,
+             downstream_depth: int | None = None)`.
+`MockSource` accepts and ignores these (its graph is fixed). Acceptable now —
 the protocol has no external implementors yet.
 
 Node mapping:
@@ -152,13 +164,14 @@ Node mapping:
 ```
 sensiflow report --source mock
 sensiflow report --source openmetadata --omd-host H --omd-token T
-                 [--root FQN ...] [--max-depth N]
+                 [--root FQN ...] [--upstream-depth N] [--downstream-depth M]
 ```
 
 `--source` gains the `openmetadata` choice; `--root` is repeatable (each
-occurrence adds one root; none = full scan); `--max-depth` caps the walk
-distance from the nearest root. Defaults stay unchanged: `mock` remains the
-default source so the zero-config demo keeps working.
+occurrence adds one root; none = full scan); `--upstream-depth` /
+`--downstream-depth` cap the walk per direction (`0` disables a direction,
+omitted = unlimited). Defaults stay unchanged: `mock` remains the default
+source so the zero-config demo keeps working.
 
 ## Consequences
 
