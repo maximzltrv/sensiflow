@@ -71,15 +71,37 @@ extra is not installed, raise `SensiflowDependencyError` with the exact fix:
 `pip install 'sensiflow[openmetadata]'`. The CLI imports this module only
 when `--source openmetadata` is requested — base install stays clean.
 
-### 3. Graph construction: lineage walk from a root, or full catalog scan
+### 3. Graph construction: lineage walk from one or more roots, or full scan
 
-`OpenMetadataSource(host, jwt_token, *, timeout=30.0).build_graph(root=None)`:
+`OpenMetadataSource(host, jwt_token, *, timeout=30.0)
+    .build_graph(roots=None, *, max_depth=None)`:
 
-- **`root` given** (a table FQN): fetch the root, walk its lineage closure
-  (upstream + downstream, breadth-first over the lineage endpoint) and build
-  the graph from every table reached. This is the recommended, cheap path.
-- **`root=None`**: paginate over all tables, then resolve lineage per table.
+- **`roots` given** (one or more table FQNs; decided 2026-09-15 — a list, not
+  a single value): BFS over the lineage endpoint from every root at once
+  (upstream + downstream), deduplicating shared ancestors/descendants, and
+  build the graph from the union of the reached closures. One root is just a
+  list of one. This is the recommended, cheap path.
+- **`roots=None`**: paginate over all tables, then resolve lineage per table.
   Documented as potentially slow on large catalogs; fine for the demo tier.
+- **`max_depth`** (decided 2026-09-15): optional hop limit from the nearest
+  root, as a tuning knob for targeted investigation. `None` (default) walks
+  to the ends of the graph with cycle protection.
+
+**Warning obligation for truncated graphs.** A depth limit can cut the walk
+off *before reaching the PII origins* (per ADR-0001's applicability
+precondition, seeds usually live at the far upstream end). A truncated graph
+with no seeds inside the horizon classifies everything `NONE` — a false-clean
+report. Therefore whenever `max_depth` trimmed at least one edge AND no seed
+node made it into the graph, the connector/report must carry an explicit
+warning ("graph truncated at depth N; no PII sources within horizon —
+findings may be incomplete") rather than silently printing an empty result.
+This extends the "no seeds anywhere" reporting rule from ADR-0001.
+
+Note: this changes the `LineageSource` protocol signature from
+`build_graph(root: str | None)` to
+`build_graph(roots: Sequence[str] | None = None, *, max_depth: int | None = None)`.
+`MockSource` accepts and ignores both (its graph is fixed). Acceptable now —
+the protocol has no external implementors yet.
 
 Node mapping:
 
@@ -129,12 +151,14 @@ Node mapping:
 
 ```
 sensiflow report --source mock
-sensiflow report --source openmetadata --omd-host H --omd-token T [--root FQN]
+sensiflow report --source openmetadata --omd-host H --omd-token T
+                 [--root FQN ...] [--max-depth N]
 ```
 
-`--source` gains the `openmetadata` choice; `--root` scopes the graph.
-Defaults stay unchanged: `mock` remains the default source so the zero-config
-demo keeps working.
+`--source` gains the `openmetadata` choice; `--root` is repeatable (each
+occurrence adds one root; none = full scan); `--max-depth` caps the walk
+distance from the nearest root. Defaults stay unchanged: `mock` remains the
+default source so the zero-config demo keeps working.
 
 ## Consequences
 
