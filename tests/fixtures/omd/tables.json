@@ -1,0 +1,250 @@
+[
+  {
+    "id": "00000000-0000-0000-0000-000000000001",
+    "name": "raw_customers",
+    "fullyQualifiedName": "demo.warehouse.crm.raw_customers",
+    "owners": [
+      {
+        "name": "core-data",
+        "email": "core-data@example.com"
+      }
+    ],
+    "schemaDefinition": null,
+    "columns": [
+      {
+        "name": "customer_id",
+        "dataType": "BIGINT",
+        "tags": []
+      },
+      {
+        "name": "email",
+        "dataType": "STRING",
+        "tags": [
+          {
+            "tagFQN": "PII.Sensitive",
+            "source": "Classification"
+          }
+        ]
+      },
+      {
+        "name": "phone",
+        "dataType": "STRING",
+        "tags": [
+          {
+            "tagFQN": "PII.Sensitive",
+            "source": "Classification"
+          }
+        ]
+      },
+      {
+        "name": "full_name",
+        "dataType": "STRING",
+        "tags": [
+          {
+            "tagFQN": "PII.Sensitive",
+            "source": "Classification"
+          }
+        ]
+      },
+      {
+        "name": "segment",
+        "dataType": "STRING",
+        "tags": []
+      }
+    ]
+  },
+  {
+    "id": "00000000-0000-0000-0000-000000000002",
+    "name": "raw_orders",
+    "fullyQualifiedName": "demo.warehouse.crm.raw_orders",
+    "owners": [
+      {
+        "name": "core-data",
+        "email": "core-data@example.com"
+      }
+    ],
+    "schemaDefinition": null,
+    "columns": [
+      {
+        "name": "order_id",
+        "dataType": "BIGINT",
+        "tags": []
+      },
+      {
+        "name": "customer_email",
+        "dataType": "STRING",
+        "tags": []
+      },
+      {
+        "name": "order_date",
+        "dataType": "DATE",
+        "tags": []
+      },
+      {
+        "name": "amount",
+        "dataType": "NUMERIC",
+        "tags": []
+      }
+    ]
+  },
+  {
+    "id": "00000000-0000-0000-0000-000000000003",
+    "name": "stg_customers",
+    "fullyQualifiedName": "demo.warehouse.crm.stg_customers",
+    "owners": [
+      {
+        "name": "core-data",
+        "email": "core-data@example.com"
+      }
+    ],
+    "schemaDefinition": "SELECT customer_id, email, phone, full_name FROM raw_customers",
+    "columns": [
+      {
+        "name": "customer_id",
+        "dataType": "BIGINT",
+        "tags": []
+      },
+      {
+        "name": "email",
+        "dataType": "STRING",
+        "tags": []
+      },
+      {
+        "name": "phone",
+        "dataType": "STRING",
+        "tags": []
+      },
+      {
+        "name": "full_name",
+        "dataType": "STRING",
+        "tags": []
+      }
+    ]
+  },
+  {
+    "id": "00000000-0000-0000-0000-000000000004",
+    "name": "dim_customers",
+    "fullyQualifiedName": "demo.warehouse.crm.dim_customers",
+    "owners": [
+      {
+        "name": "analytics",
+        "email": "analytics@example.com"
+      }
+    ],
+    "schemaDefinition": "SELECT customer_id, email, full_name, segment FROM stg_customers",
+    "columns": [
+      {
+        "name": "customer_id",
+        "dataType": "BIGINT",
+        "tags": []
+      },
+      {
+        "name": "email",
+        "dataType": "STRING",
+        "tags": []
+      },
+      {
+        "name": "full_name",
+        "dataType": "STRING",
+        "tags": []
+      },
+      {
+        "name": "segment",
+        "dataType": "STRING",
+        "tags": []
+      }
+    ]
+  },
+  {
+    "id": "00000000-0000-0000-0000-000000000005",
+    "name": "mart_orders_enriched",
+    "fullyQualifiedName": "demo.warehouse.crm.mart_orders_enriched",
+    "owners": [
+      {
+        "name": "analytics",
+        "email": "analytics@example.com"
+      }
+    ],
+    "schemaDefinition": "SELECT o.order_id, o.order_date, o.amount, c.segment FROM raw_orders AS o JOIN dim_customers AS c ON o.customer_email = c.email",
+    "columns": [
+      {
+        "name": "order_id",
+        "dataType": "BIGINT",
+        "tags": []
+      },
+      {
+        "name": "order_date",
+        "dataType": "DATE",
+        "tags": []
+      },
+      {
+        "name": "amount",
+        "dataType": "NUMERIC",
+        "tags": []
+      },
+      {
+        "name": "segment",
+        "dataType": "STRING",
+        "tags": []
+      }
+    ]
+  },
+  {
+    "id": "00000000-0000-0000-0000-000000000006",
+    "name": "mart_customer_dump",
+    "fullyQualifiedName": "demo.warehouse.crm.mart_customer_dump",
+    "owners": [
+      {
+        "name": "marketing",
+        "email": "marketing@example.com"
+      }
+    ],
+    "schemaDefinition": "SELECT * FROM dim_customers",
+    "columns": [
+      {
+        "name": "customer_id",
+        "dataType": "BIGINT",
+        "tags": []
+      },
+      {
+        "name": "email",
+        "dataType": "STRING",
+        "tags": []
+      },
+      {
+        "name": "full_name",
+        "dataType": "STRING",
+        "tags": []
+      },
+      {
+        "name": "segment",
+        "dataType": "STRING",
+        "tags": []
+      }
+    ]
+  },
+  {
+    "id": "00000000-0000-0000-0000-000000000007",
+    "name": "mart_daily_revenue",
+    "fullyQualifiedName": "demo.warehouse.crm.mart_daily_revenue",
+    "owners": [
+      {
+        "name": "finance",
+        "email": "finance@example.com"
+      }
+    ],
+    "schemaDefinition": "SELECT order_date, SUM(amount) AS revenue FROM mart_orders_enriched GROUP BY order_date",
+    "columns": [
+      {
+        "name": "order_date",
+        "dataType": "DATE",
+        "tags": []
+      },
+      {
+        "name": "revenue",
+        "dataType": "NUMERIC",
+        "tags": []
+      }
+    ]
+  }
+]

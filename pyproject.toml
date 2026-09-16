@@ -21,6 +21,9 @@ classifiers = [
 ]
 dynamic = ["dependencies"]
 
+[project.optional-dependencies]
+openmetadata = ["httpx>=0.27"]
+
 [project.scripts]
 sensiflow = "sensiflow.cli:main"
 

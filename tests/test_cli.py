@@ -50,10 +50,28 @@ def test_text_is_the_default_format(capsys: pytest.CaptureFixture[str]) -> None:
 
 def test_unknown_source_is_rejected(capsys: pytest.CaptureFixture[str]) -> None:
     with pytest.raises(SystemExit) as excinfo:
-        main(["report", "--source", "openmetadata"])
+        main(["report", "--source", "dbt"])
     # argparse exits with code 2 on invalid choices; stderr names the argument.
     assert excinfo.value.code == 2
     assert "--source" in capsys.readouterr().err
+
+
+def test_openmetadata_requires_credentials(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("OMD_HOST", raising=False)
+    monkeypatch.delenv("OMD_TOKEN", raising=False)
+    with pytest.raises(SystemExit) as excinfo:
+        main(["report", "--source", "openmetadata"])
+    assert excinfo.value.code == 2
+    assert "OMD_HOST" in capsys.readouterr().err
+
+
+def test_negative_depth_is_rejected(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        main(["report", "--upstream-depth", "-1"])
+    assert excinfo.value.code == 2
+    assert "upstream-depth" in capsys.readouterr().err
 
 
 def test_missing_command_is_rejected(capsys: pytest.CaptureFixture[str]) -> None:

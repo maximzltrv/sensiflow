@@ -188,4 +188,10 @@ def trace(
             findings=findings,
         )
 
-    return TraceResult(nodes=results)
+    warnings = list(graph.warnings)
+    if graph.nodes and not any(node.declared_pii for node in graph.nodes.values()):
+        warnings.append(
+            "no PII seeds declared anywhere in the graph — nothing to propagate "
+            "(see applicability preconditions, ADR-0001)"
+        )
+    return TraceResult(nodes=results, warnings=warnings)
