@@ -1,6 +1,7 @@
 # ADR-0002: OpenMetadata connector — thin REST client behind an optional extra
 
-- **Status:** Proposed (awaiting author review)
+- **Status:** Accepted (2026-09-16, after author review; amendments during
+  review: multi-root walk, per-direction depth limits, truncation warnings)
 - **Date:** 2026-08-27
 - **Deciders:** Maksim Zolotarev
 
