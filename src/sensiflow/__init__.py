@@ -1,6 +1,11 @@
 """sensiflow — propagate PII tags along data lineage and classify exposure risk."""
 
 from sensiflow.engine import DEFAULT_GENERIC_COLUMNS, trace
+from sensiflow.exceptions import (
+    SensiflowConnectionError,
+    SensiflowDependencyError,
+    SensiflowError,
+)
 from sensiflow.model import (
     Finding,
     LineageGraph,
@@ -21,6 +26,9 @@ __all__ = [
     "NodeResult",
     "PiiTag",
     "Risk",
+    "SensiflowConnectionError",
+    "SensiflowDependencyError",
+    "SensiflowError",
     "TraceResult",
     "__version__",
     "trace",

@@ -38,9 +38,15 @@ class Node:
 
 @dataclass
 class LineageGraph:
-    """An abstract lineage graph keyed by node id."""
+    """An abstract lineage graph keyed by node id.
+
+    ``warnings`` carries caveats produced while *building* the graph (e.g. a
+    depth-truncated lineage walk); the engine passes them through to the
+    TraceResult so no renderer can silently drop them.
+    """
 
     nodes: dict[str, Node]
+    warnings: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -77,6 +83,7 @@ class TraceResult:
     """The full result of a trace over a lineage graph."""
 
     nodes: dict[str, NodeResult]
+    warnings: list[str] = field(default_factory=list)
 
     def by_risk(self, minimum: Risk = "LOW") -> list[NodeResult]:
         """Nodes at or above ``minimum`` risk, most exposed first."""

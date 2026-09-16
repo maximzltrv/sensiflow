@@ -14,8 +14,9 @@ def render_text(result: TraceResult) -> str:
         f"sensiflow report — {len(result.nodes)} nodes analyzed",
         "summary: " + "  ".join(f"{risk}={summary[risk]}" for risk in RISK_RANK if risk != "NONE")
         + f"  NONE={summary['NONE']}",
-        "",
     ]
+    lines.extend(f"warning: {warning}" for warning in result.warnings)
+    lines.append("")
     ordered = sorted(
         result.nodes.values(), key=lambda n: (-RISK_RANK[n.max_risk], n.name)
     )
@@ -39,6 +40,7 @@ def render_json(result: TraceResult) -> dict[str, Any]:
     )
     return {
         "summary": result.summary(),
+        "warnings": list(result.warnings),
         "nodes": [
             {
                 "node_id": node.node_id,

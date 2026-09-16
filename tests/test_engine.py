@@ -130,6 +130,28 @@ def test_cycle_raises() -> None:
         trace(graph)
 
 
+def test_no_seeds_anywhere_produces_warning() -> None:
+    graph = LineageGraph(
+        nodes={
+            "a": Node(id="a", name="a"),
+            "b": Node(id="b", name="b", upstream=["a"], sql="SELECT x FROM a"),
+        }
+    )
+    result = trace(graph)
+    assert all(node.max_risk == "NONE" for node in result.nodes.values())
+    assert any("no PII seeds" in warning for warning in result.warnings)
+
+
+def test_graph_warnings_pass_through_to_result() -> None:
+    graph = LineageGraph(
+        nodes={"src": Node(id="src", name="src", declared_pii={"email": PiiTag("email")})},
+        warnings=["downstream truncated at depth 1; consumers below this horizon "
+                  "were not analyzed"],
+    )
+    result = trace(graph)
+    assert result.warnings == graph.warnings
+
+
 # --- result API --------------------------------------------------------------
 
 

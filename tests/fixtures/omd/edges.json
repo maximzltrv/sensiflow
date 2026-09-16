@@ -1,0 +1,28 @@
+{
+  "edges": [
+    {
+      "from": "demo.warehouse.crm.raw_customers",
+      "to": "demo.warehouse.crm.stg_customers"
+    },
+    {
+      "from": "demo.warehouse.crm.stg_customers",
+      "to": "demo.warehouse.crm.dim_customers"
+    },
+    {
+      "from": "demo.warehouse.crm.dim_customers",
+      "to": "demo.warehouse.crm.mart_orders_enriched"
+    },
+    {
+      "from": "demo.warehouse.crm.raw_orders",
+      "to": "demo.warehouse.crm.mart_orders_enriched"
+    },
+    {
+      "from": "demo.warehouse.crm.dim_customers",
+      "to": "demo.warehouse.crm.mart_customer_dump"
+    },
+    {
+      "from": "demo.warehouse.crm.mart_orders_enriched",
+      "to": "demo.warehouse.crm.mart_daily_revenue"
+    }
+  ]
+}

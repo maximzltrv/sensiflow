@@ -15,13 +15,25 @@ All names are synthetic; there is no real company behind them.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from sensiflow.model import LineageGraph, Node, PiiTag
 
 
 class MockSource:
-    """A LineageSource returning a small fixed synthetic graph."""
+    """A LineageSource returning a small fixed synthetic graph.
 
-    def build_graph(self, root: str | None = None) -> LineageGraph:
+    The graph is a fixture: roots and depth limits are accepted (to satisfy
+    the LineageSource protocol) but ignored.
+    """
+
+    def build_graph(
+        self,
+        roots: Sequence[str] | None = None,
+        *,
+        upstream_depth: int | None = None,
+        downstream_depth: int | None = None,
+    ) -> LineageGraph:
         nodes = [
             Node(
                 id="raw_customers",
