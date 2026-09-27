@@ -1,0 +1,206 @@
+{
+  "metadata": {
+    "dbt_schema_version": "https://schemas.getdbt.com/dbt/manifest/v12.json",
+    "project_name": "demo_shop"
+  },
+  "nodes": {
+    "model.demo_shop.stg_customers": {
+      "resource_type": "model",
+      "name": "stg_customers",
+      "depends_on": {
+        "nodes": [
+          "source.demo_shop.crm.raw_customers"
+        ],
+        "macros": []
+      },
+      "columns": {},
+      "config": {
+        "meta": {
+          "owner": "core-data@example.com"
+        }
+      },
+      "compiled_code": "SELECT customer_id, email, phone, full_name FROM raw_customers",
+      "raw_code": "SELECT customer_id, email, phone, full_name FROM {{ source('crm', 'raw_customers') }}"
+    },
+    "model.demo_shop.dim_customers": {
+      "resource_type": "model",
+      "name": "dim_customers",
+      "depends_on": {
+        "nodes": [
+          "model.demo_shop.stg_customers"
+        ],
+        "macros": []
+      },
+      "columns": {},
+      "config": {
+        "meta": {
+          "owner": [
+            "analytics@example.com",
+            "governance@example.com"
+          ]
+        }
+      },
+      "compiled_code": "SELECT customer_id, email, full_name, segment FROM stg_customers"
+    },
+    "model.demo_shop.mart_orders_enriched": {
+      "resource_type": "model",
+      "name": "mart_orders_enriched",
+      "depends_on": {
+        "nodes": [
+          "model.demo_shop.dim_customers",
+          "source.demo_shop.crm.raw_orders"
+        ],
+        "macros": []
+      },
+      "columns": {},
+      "config": {
+        "meta": {
+          "owner": "analytics@example.com"
+        }
+      },
+      "compiled_code": "SELECT o.order_id, o.order_date, o.amount, c.segment FROM raw_orders AS o JOIN dim_customers AS c ON o.customer_email = c.email"
+    },
+    "model.demo_shop.mart_customer_dump": {
+      "resource_type": "model",
+      "name": "mart_customer_dump",
+      "depends_on": {
+        "nodes": [
+          "model.demo_shop.dim_customers"
+        ],
+        "macros": []
+      },
+      "columns": {},
+      "config": {
+        "meta": {}
+      },
+      "group": "marketing",
+      "compiled_code": "SELECT * FROM dim_customers"
+    },
+    "model.demo_shop.mart_daily_revenue": {
+      "resource_type": "model",
+      "name": "mart_daily_revenue",
+      "depends_on": {
+        "nodes": [
+          "model.demo_shop.mart_orders_enriched"
+        ],
+        "macros": []
+      },
+      "columns": {},
+      "config": {
+        "meta": {
+          "owner": "finance@example.com"
+        }
+      },
+      "compiled_code": "SELECT order_date, SUM(amount) AS revenue FROM mart_orders_enriched GROUP BY order_date"
+    },
+    "model.demo_shop.mart_raw_only": {
+      "resource_type": "model",
+      "name": "mart_raw_only",
+      "depends_on": {
+        "nodes": [
+          "model.demo_shop.dim_customers"
+        ],
+        "macros": []
+      },
+      "columns": {},
+      "config": {
+        "meta": {}
+      },
+      "raw_code": "SELECT email FROM {{ ref('dim_customers') }}"
+    },
+    "seed.demo_shop.country_codes": {
+      "resource_type": "seed",
+      "name": "country_codes",
+      "depends_on": {
+        "nodes": [],
+        "macros": []
+      },
+      "columns": {},
+      "raw_code": ""
+    },
+    "test.demo_shop.not_null_stg_customers_email": {
+      "resource_type": "test",
+      "name": "not_null_stg_customers_email",
+      "depends_on": {
+        "nodes": [
+          "model.demo_shop.stg_customers"
+        ],
+        "macros": []
+      }
+    }
+  },
+  "sources": {
+    "source.demo_shop.crm.raw_customers": {
+      "resource_type": "source",
+      "name": "raw_customers",
+      "meta": {
+        "owner": "core-data@example.com"
+      },
+      "columns": {
+        "customer_id": {
+          "name": "customer_id",
+          "meta": {},
+          "tags": []
+        },
+        "email": {
+          "name": "email",
+          "meta": {
+            "pii": true,
+            "pii_category": "email"
+          },
+          "tags": []
+        },
+        "phone": {
+          "name": "phone",
+          "meta": {
+            "pii": true,
+            "pii_category": "phone",
+            "pii_sensitive": true
+          },
+          "tags": []
+        },
+        "full_name": {
+          "name": "full_name",
+          "meta": {},
+          "tags": [
+            "pii:name"
+          ]
+        },
+        "segment": {
+          "name": "segment",
+          "meta": {},
+          "tags": []
+        }
+      }
+    },
+    "source.demo_shop.crm.raw_orders": {
+      "resource_type": "source",
+      "name": "raw_orders",
+      "meta": {
+        "owner": "core-data@example.com"
+      },
+      "columns": {
+        "order_id": {
+          "name": "order_id",
+          "meta": {},
+          "tags": []
+        },
+        "customer_email": {
+          "name": "customer_email",
+          "meta": {},
+          "tags": []
+        },
+        "order_date": {
+          "name": "order_date",
+          "meta": {},
+          "tags": []
+        },
+        "amount": {
+          "name": "amount",
+          "meta": {},
+          "tags": []
+        }
+      }
+    }
+  }
+}

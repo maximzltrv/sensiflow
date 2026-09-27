@@ -24,7 +24,7 @@ def _build_parser() -> argparse.ArgumentParser:
     report = subparsers.add_parser("report", help="analyze lineage and print a risk report")
     report.add_argument(
         "--source",
-        choices=["mock", "openmetadata"],
+        choices=["mock", "openmetadata", "dbt"],
         default="mock",
         help="lineage source (default: the built-in mock graph)",
     )
@@ -46,6 +46,11 @@ def _build_parser() -> argparse.ArgumentParser:
     report.add_argument(
         "--omd-token",
         help="OpenMetadata JWT token (or OMD_TOKEN env var; prefer the env var)",
+    )
+    report.add_argument(
+        "--dbt-manifest",
+        metavar="PATH",
+        help="path to a dbt manifest.json (required with --source dbt)",
     )
     report.add_argument(
         "--root",
@@ -80,6 +85,12 @@ def _make_source(parser: argparse.ArgumentParser, args: argparse.Namespace) -> L
         from sensiflow.sources.openmetadata import OpenMetadataSource
 
         return OpenMetadataSource(host, token)
+    if args.source == "dbt":
+        if not args.dbt_manifest:
+            parser.error("--source dbt requires --dbt-manifest PATH")
+        from sensiflow.sources.dbt import DbtSource
+
+        return DbtSource(args.dbt_manifest)
     return MockSource()
 
 

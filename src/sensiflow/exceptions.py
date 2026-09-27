@@ -21,3 +21,7 @@ class SensiflowConnectionError(SensiflowError):
     Messages must identify the host and status but never carry credentials
     or request headers (ADR-0002 secrets hygiene).
     """
+
+
+class SensiflowInputError(SensiflowError):
+    """Bad local input: missing/invalid manifest file, ambiguous root, etc."""
