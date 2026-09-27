@@ -1,13 +1,10 @@
 # ADR-0003: dbt connector — manifest.json as a zero-dependency lineage source
 
-- **Status:** Proposed (awaiting author review)
+- **Status:** Accepted (2026-09-27, after author review)
 - **Date:** 2026-09-20
 - **Deciders:** Maksim Zolotarev
 
 ## Context
-
-Backlog item #1 ("dbt as a first-class lineage source") is promoted to the
-next slice, ahead of broader testing and the public write-up. Motivation:
 
 1. **Reach.** Every dbt shop has a `manifest.json`; none of them needs a
    running catalog. This makes sensiflow demoable and adoptable with zero
@@ -140,7 +137,7 @@ precise.
 ### Positive
 
 - First truly zero-setup path to value: any dbt repo, one command, no
-  server, no token. This is the demo for the planned article.
+  server, no token.
 - Base install still has a single dependency (`sqlglot`).
 - Engine untouched; the `LineageSource` seam proves itself on a second,
   very different source (local file vs REST API).
@@ -164,8 +161,8 @@ precise.
 
 - Configurable annotation->tag mapping shared by dbt and OMD connectors.
 - Possible `[dbt]` extra later only if a real dependency appears.
-- Article demo script: run against a public sample dbt project (e.g.
-  jaffle-shop-style synthetic repo we author ourselves — clean-room).
+- A synthetic public sample dbt project (jaffle-shop-style, authored from
+  scratch) as a self-contained demo target.
 
 ## Alternatives considered
 
