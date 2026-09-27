@@ -5,6 +5,7 @@ from sensiflow.exceptions import (
     SensiflowConnectionError,
     SensiflowDependencyError,
     SensiflowError,
+    SensiflowInputError,
 )
 from sensiflow.model import (
     Finding,
@@ -29,6 +30,7 @@ __all__ = [
     "SensiflowConnectionError",
     "SensiflowDependencyError",
     "SensiflowError",
+    "SensiflowInputError",
     "TraceResult",
     "__version__",
     "trace",
