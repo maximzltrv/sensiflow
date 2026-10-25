@@ -28,3 +28,6 @@ htmlcov/
 .idea/
 .vscode/
 .DS_Store
+
+# Local Claude Code config (agent team, settings) — not for the public repo
+.claude/
