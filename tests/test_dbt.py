@@ -258,7 +258,7 @@ def test_cli_dbt_requires_manifest_flag(capsys: pytest.CaptureFixture[str]) -> N
 def test_cli_dbt_missing_file_is_clean_error(capsys: pytest.CaptureFixture[str]) -> None:
     exit_code = main(["report", "--source", "dbt", "--dbt-manifest", "/nowhere.json"])
     captured = capsys.readouterr()
-    assert exit_code == 1
+    assert exit_code == 2
     assert captured.err.startswith("error:")
 
 

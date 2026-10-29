@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from sensiflow import LineageGraph, Node, NodeResult, PiiTag, trace
+from sensiflow.exceptions import SensiflowInputError
 from sensiflow.sources.mock import MockSource
 
 
@@ -126,7 +127,7 @@ def test_cycle_raises() -> None:
             "b": Node(id="b", name="b", upstream=["a"]),
         }
     )
-    with pytest.raises(ValueError, match="cycle"):
+    with pytest.raises(SensiflowInputError, match="cycle"):
         trace(graph)
 
 

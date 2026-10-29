@@ -16,6 +16,7 @@ from collections import deque
 from collections.abc import Callable
 from types import ModuleType
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit
 
 from sensiflow.exceptions import (
     SensiflowConnectionError,
@@ -84,6 +85,14 @@ def _node_from_table(table: dict[str, Any], upstream: list[str]) -> Node:
     )
 
 
+def _has_userinfo(host: str) -> bool:
+    try:
+        parts = urlsplit(host)
+    except ValueError:
+        return False
+    return "@" in parts.netloc
+
+
 class OpenMetadataSource:
     """Read-only LineageSource over the OpenMetadata REST API."""
 
@@ -95,6 +104,18 @@ class OpenMetadataSource:
         timeout: float = 30.0,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
+        # Scheme first: a scheme-less "user:pw@host" parses with no netloc, so it
+        # must be rejected here, before any code path could interpolate the host.
+        if not host.lower().startswith(("http://", "https://")):
+            raise SensiflowInputError(
+                "the OpenMetadata host URL must start with http:// or https://"
+            )
+        if _has_userinfo(host):
+            # Never echo the userinfo: it would leak the embedded credentials.
+            raise SensiflowInputError(
+                "credentials embedded in the OpenMetadata host URL are not supported; "
+                "pass the JWT via --omd-token / OMD_TOKEN"
+            )
         self.host = host.rstrip("/")
         self._token = jwt_token
         self._timeout = timeout

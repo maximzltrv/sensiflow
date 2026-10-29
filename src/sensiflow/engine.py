@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from sensiflow.exceptions import SensiflowInputError
 from sensiflow.model import Finding, LineageGraph, NodeResult, PiiTag, TraceResult
 from sensiflow.sql_analysis import analyze_sql
 
@@ -57,7 +58,9 @@ def _topological_order(graph: LineageGraph) -> list[str]:
             if not remaining_deps[down]:
                 ready.append(down)
     if len(order) != len(graph.nodes):
-        raise ValueError("lineage graph contains a cycle")
+        stuck = sorted(node_id for node_id, deps in remaining_deps.items() if deps)
+        shown = ", ".join(stuck[:5]) + (", ..." if len(stuck) > 5 else "")
+        raise SensiflowInputError(f"lineage graph contains a cycle (unresolved nodes: {shown})")
     return order
 
 
