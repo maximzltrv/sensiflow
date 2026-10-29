@@ -3,7 +3,8 @@
 - **Status:** Accepted (2026-10-29, after review; review decisions:
   `--fail-on` required with no default; warnings do not affect the exit code
   in v1; `--min-confidence` included in this slice with suppressed findings
-  surfaced, never hidden; `report` error exits aligned to the taxonomy)
+  surfaced, never hidden; `report` error exits aligned to the taxonomy).
+  Amended 2026-10-29 after implementation review — see Amendments A1–A4.
 - **Date:** 2026-10-29
 - **Deciders:** Maksim Zolotarev
 
@@ -412,6 +413,85 @@ information.
     visible in both output formats, and CI cannot do anything with it except
     what reading the output achieves. Rejected; revisit only with the
     warnings question if evidence demands a "qualified pass" concept.
+
+## Amendments (2026-10-29, post-implementation review)
+
+Implementation review surfaced four points where the decision text was
+silent or ambiguous. The following clarifications are part of the accepted
+decision.
+
+### A1. The exception wrapper applies to every command
+
+§1's mechanism paragraph named only `check`, while the taxonomy table says
+"any command". The table is authoritative: **every** subcommand (`report`
+and `check` today, future commands too) runs inside the same wrapper —
+`SensiflowError` subclasses map to 2 or 3 per the table, and any other
+exception is printed with its full traceback to stderr and maps to 3.
+`report` therefore can never exit 1 under any input, including inputs that
+crash the engine.
+
+### A2. Failures to write the result to stdout
+
+The decision made the exit code the authoritative verdict channel but did
+not say what happens when writing the stdout document itself fails. The
+emission of the result is part of the protected region — a write failure
+must never surface as an unhandled exception (which would exit 1 and fake a
+gate trip). Two cases, separated by whether anything actually went wrong:
+
+- **`BrokenPipeError` (EPIPE)** after the verdict is computed: the consumer
+  stopped reading (`check ... | head`). Nothing failed in the run; the
+  verdict stands. The process exits with the computed verdict code (0 or 1),
+  suppressing the secondary pipe traceback.
+- **Any other write failure** (encoding errors under a constrained locale,
+  disk full, I/O error): the result document was not delivered, so the run
+  did not complete — exit 3, traceback to stderr (best effort).
+
+Alternatives considered: mapping EPIPE to 3 would turn `check | head -1`
+into a false "operational error" and invite pointless CI retries on an
+already-decided verdict — rejected. Letting write failures propagate exits 1
+and is indistinguishable from a gate trip, which §1 forbids — rejected.
+
+### A3. A cyclic lineage graph is an input error (exit 2)
+
+The engine detects cycles deliberately; a cyclic graph describes impossible
+lineage in the user's catalog or manifest — not retryable, not a tool bug.
+The engine's cycle error is reclassified from a plain `ValueError` to
+`SensiflowInputError`, mapping to exit 2 with a one-line message instead of
+exit 3 with a traceback. This amends the "zero engine changes" consequence
+by exactly one exception type; propagation logic is untouched.
+Alternative — leave it at 3 as an "unexpected internal error": rejected; the
+error is neither unexpected (it is explicitly raised) nor environmental.
+
+### A4. The §5 confidence comparison happens at published precision
+
+Engine confidences are products of heuristic factors; the float product of,
+e.g., `0.8 * 0.7` is `0.5599999999999999`, which every output channel
+publishes as `0.56` (the JSON renderer rounds confidences to 4 decimal
+places). A user copying the published value into `--min-confidence` would
+see the finding suppressed — a false negative in the gate's dangerous
+direction, induced by the tool's own output.
+
+Decision: `evaluate_gate` performs the inclusive comparison at the published
+precision — both the finding's confidence and `min_confidence` are rounded
+to 4 decimal places (the JSON output precision) before the `>=` comparison.
+The range validation of `min_confidence` still applies to the raw value.
+
+Alternatives considered:
+
+- **Round confidences in the engine when producing findings.** Makes one
+  number true everywhere, but changes core engine output to solve a
+  display-precision problem, ripples into `report` output and the ADR-0001
+  confidence model, and raises its own design question (round per
+  propagation step or only at publication). Rejected as out of proportion
+  and out of this slice's scope.
+- **Document-only.** Leaves a gate false negative triggered by the tool's
+  own published values. Rejected.
+
+Caveat: the text renderer displays confidences at 2 decimal places, so a
+threshold copied from text output can still mismatch a finding whose true
+confidence has more digits. The JSON document is the machine-precision
+channel; user docs should recommend taking thresholds from it. Suppressed
+findings remain always visible (§5), so any residual mismatch is auditable.
 
 ## Review resolutions (2026-10-29)
 
