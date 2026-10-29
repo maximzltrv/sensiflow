@@ -2,7 +2,8 @@
 
 - **Status:** Accepted (2026-09-16, after author review; amendments during
   review: multi-root walk, per-direction depth limits, truncation warnings);
-  amended 2026-10-29: root selectors (Proposed, awaiting review)
+  amended 2026-10-29: root selectors (Accepted 2026-10-29, after review:
+  lazy pyyaml extra, strict zero-match, `GraphSelection` spec object)
 - **Date:** 2026-08-27
 - **Deciders:** Maksim Zolotarev
 
@@ -222,7 +223,7 @@ source so the zero-config demo keeps working.
 
 ## Amendment (2026-10-29): root selectors
 
-- **Status:** Proposed (awaiting review)
+- **Status:** Accepted (2026-10-29, after team-lead review)
 
 ### Context
 
@@ -316,12 +317,12 @@ file and the exact problem:
 | An `id` value must not contain `*`, `?`, `[` | "glob characters in 'id' entry — use 'pattern'" |
 | A `pattern` value must contain at least one of `*`, `?`, `[` | "no glob characters in 'pattern' entry — use 'id'" |
 
-The last two rules keep the file lossless: after loading, entries collapse to
-the same selector strings the CLI `--root` channel produces, with no
-ambiguity about which entry was meant as exact and which as a pattern. Both
-kinds fail hard when they resolve to nothing (A6), so the distinction does
-not change failure behavior — its value is message precision ("unknown root
-id 'X'" vs "root pattern 'X' matched no tables"). There
+The last two rules keep the file lossless: `id` entries map 1:1 onto
+`GraphSelection.roots` and `pattern` entries onto `GraphSelection.patterns`
+(A4), with no ambiguity about which entry was meant as exact and which as a
+pattern. Both kinds fail hard when they resolve to nothing (A6), so the
+distinction does not change failure behavior — its value is message
+precision ("unknown root id 'X'" vs "root pattern 'X' matched no tables"). There
 is deliberately no second way to express anything — no free-form sections, no
 per-entry options. Future needs (per-root depths, comments beyond YAML `#`)
 require a `version: 2` and a new review, not schema creep.
@@ -330,40 +331,76 @@ require a `version: 2` and a new review, not schema creep.
 
 A new module `src/sensiflow/root_selectors.py` — a sibling of
 `graph_scope.py`, i.e. source-adjacent shared infrastructure, invisible to
-the engine — owns:
+the engine — owns the selection spec object, the file loader, and the
+matching rules, so dbt and OMD cannot drift apart.
 
-- `load_roots_file(path) -> list[str]`: parse + strict validation (A3),
-  returning plain selector strings;
-- classification of a selector string as exact vs pattern (the
-  metacharacter test, defined in exactly one place);
-- `resolve_patterns(selectors, candidates) -> list[str]`: fnmatch resolution
-  of pattern selectors against an iterable of `(id, name)` candidate pairs,
-  producing matched node ids; a pattern that matches nothing raises
-  `SensiflowInputError` (A6).
-
-Connectors stay thin: they supply candidates and keep their exact-root
-semantics; the matching rules live in one module, so dbt and OMD cannot
-drift apart. The CLI merges `--root` values with the loaded file entries and
-passes a flat list of selector strings to `build_graph`.
-
-**Protocol change** (third revision; still acceptable — the protocol has no
-external implementors yet, but this should be the last pre-1.0 signature
-change without a deprecation story):
+**The spec object.** The entire graph-scoping request is one frozen,
+keyword-constructed dataclass:
 
 ```python
-def build_graph(
-    self,
-    roots: Sequence[str] | None = None,   # entries may now be glob patterns
-    *,
-    roots_from_seeds: bool = False,       # NEW; mutually exclusive with roots
-    upstream_depth: int | None = None,
-    downstream_depth: int | None = None,
-) -> LineageGraph: ...
+@dataclass(frozen=True)
+class GraphSelection:
+    roots: tuple[str, ...] = ()        # exact node ids (connector's exact semantics)
+    patterns: tuple[str, ...] = ()     # fnmatch globs against node id and bare name
+    from_seeds: bool = False           # every PII-seeded node becomes a root
+    upstream_depth: int | None = None  # None = unlimited, 0 = direction disabled
+    downstream_depth: int | None = None
 ```
 
-Passing both `roots` and `roots_from_seeds=True` raises
-`SensiflowInputError`. `MockSource` accepts and ignores the new parameter,
-as it already does for the others (fixed graph).
+Depths live **inside** the object, deliberately: they describe the same
+graph-scoping request as the roots (truncation semantics are defined per
+union of roots, §3), and folding every scoping knob into one value is what
+makes the method signature permanently stable. Validation happens at
+construction (`__post_init__`) — fail early, in exactly one place, shared
+by CLI, file loader, and library callers:
+
+- `from_seeds=True` with non-empty `roots`/`patterns` →
+  `SensiflowInputError` (the A2 exclusivity rule, enforced at the source of
+  truth rather than in the CLI);
+- `roots` entries must be non-empty strings without glob metacharacters
+  ("use patterns"); `patterns` entries must contain at least one
+  metacharacter ("use roots") — the same two rules as the YAML schema (A3);
+- depths must be `None` or `>= 0`, and a depth given on an otherwise-empty
+  selection is rejected ("depths require roots"): a full scan has no roots
+  to measure hops from;
+- `GraphSelection()` (all defaults) is valid and means "full scan",
+  equivalent to passing `None`.
+
+**The final protocol shape** (the last signature revision after
+`build_graph(root)` and `build_graph(roots, *, depths...)` — all three
+in-repo sources and the CLI migrate in the same change; the protocol still
+has no external implementors, so this is the moment to spend the last cheap
+break):
+
+```python
+class LineageSource(Protocol):
+    def build_graph(self, selection: GraphSelection | None = None) -> LineageGraph: ...
+```
+
+**The protocol is now shape-stable: future extensions add OPTIONAL fields
+(with defaults) to `GraphSelection`, never parameters to `build_graph`.**
+Library ergonomics stay terse: `build_graph()` is the full scan,
+`build_graph(GraphSelection(roots=("demo.wh.sales.orders",)))` the common
+case. `MockSource` accepts and ignores the selection (fixed graph), as it
+did with the old parameters.
+
+**Supporting functions** in the same module:
+
+- `load_roots_file(path) -> GraphSelection`: parse + strict validation
+  (A3), returning a selection with `roots`/`patterns` populated and every
+  other field at its default. The CLI combines it with flag-derived values
+  (union of roots and patterns per A2, depths from flags) into the final
+  object; no public merge API is promised in v1.
+- `resolve_patterns(patterns, candidates) -> list[str]`: fnmatch resolution
+  against an iterable of `(id, name)` candidate pairs, producing matched
+  node ids; a pattern that matches nothing raises `SensiflowInputError`
+  (A6).
+
+CLI flags map 1:1 onto the object: each `--root` value is classified by the
+metacharacter test into `roots` or `patterns`, `--roots-file` contributes
+via the loader, `--roots-from-seeds` sets `from_seeds`, and the depth flags
+set the depth fields. `GraphSelection` is public API, exported from the
+package root alongside the model dataclasses.
 
 #### A5. Per-connector resolution cost — stated honestly
 
@@ -371,7 +408,7 @@ as it already does for the others (fixed graph).
   graph vertices, resolution is an in-memory filter, and scoping remains the
   `graph_scope.scope_graph` post-filter of ADR-0003 §5.
 - **OpenMetadata:** exact-FQN roots keep today's listing-free path (straight
-  to the lineage endpoint). Any pattern selector or `roots_from_seeds=True`
+  to the lineage endpoint). Any pattern selector or `from_seeds=True`
   first requires **one paginated pass over `/api/v1/tables`** to obtain
   candidate FQNs/names (and, for from-seeds, column tags — a heavier payload
   since `fields=columns,tags` must be requested). After resolution, the
@@ -494,7 +531,9 @@ Negative / accepted trade-offs:
 - fnmatch is case-sensitive and not segment-aware; both are documented
   behaviors rather than options (no new knobs in v1).
 - Exact bare-name roots remain dbt-only (A5 asymmetry).
-- Third `build_graph` signature change; flagged as the last cheap one.
+- One more (and final) `build_graph` signature change, spent deliberately on
+  the `GraphSelection` object so the protocol never changes shape again;
+  all in-repo sources and the CLI migrate in the same change.
 
 ### Alternatives considered
 
@@ -524,12 +563,19 @@ Negative / accepted trade-offs:
    opt-in convenience feature, and the connector-extra precedent (§1–§2)
    already gives users a well-understood install-hint pattern. Rejected in
    review (2026-10-29) in favor of the lazy-optional extra (A8).
-6. **A `seeds:` magic selector string instead of the `roots_from_seeds`
-   flag.** Rejected: it squats in the id namespace and hides a mode switch
-   inside data.
+6. **A `seeds:` magic selector string instead of the `from_seeds` field.**
+   Rejected: it squats in the id namespace and hides a mode switch inside
+   data.
 7. **Fallback to full scan when selectors match nothing.** Rejected: it
    converts a typo into the most expensive run the connector can make and
    masks the error.
+8. **Keep growing keyword parameters on `build_graph`** (add
+   `roots_from_seeds: bool` next to the existing four). Smallest immediate
+   diff, but every future scoping feature would change the protocol
+   signature again — against every implementor, forever. Rejected in review
+   (2026-10-29) in favor of spending one final signature change on the
+   `GraphSelection` object (A4), after which extensions are optional fields
+   on the object, not method parameters.
 
 ### Review notes (2026-10-29)
 
@@ -541,8 +587,9 @@ Resolved during review:
    rejected.
 3. Case-sensitive matching only in v1 — confirmed.
 4. `--roots-file` accepted at most once per invocation — confirmed.
-
-### Open questions for review
-
-1. Confirmation that this is the last compatible `build_graph` signature
-   change before the protocol is considered stable.
+5. The last pre-stability signature change is spent on the `GraphSelection`
+   spec object (A4, alternative 8): `build_graph(selection=None)` is the
+   final shape. Rationale: upcoming work (CI gate, write-back, deployment
+   and agent interfaces) builds on top of this protocol, so it must stop
+   moving; from here on, scoping extensions are optional fields on
+   `GraphSelection`, never new method parameters.
