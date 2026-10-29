@@ -4,6 +4,8 @@ The gate decision — "do these results violate this policy?" — is library
 logic: no printing, no exit codes, no I/O. The CLI maps a
 :class:`GateOutcome` to the process exit contract; library callers get the
 identical semantics via ``evaluate_gate(trace(graph), fail_on="HIGH")``.
+
+Confidence is compared at the published 4-decimal precision (ADR-0004 A4).
 """
 
 from __future__ import annotations
@@ -40,7 +42,11 @@ def evaluate_gate(
     """Evaluate the gate policy per finding; never recomputes engine output.
 
     A finding *gates* when its risk ranks at or above ``fail_on`` and its
-    confidence is ``>= min_confidence`` (both inclusive). A node is a
+    confidence is ``>= min_confidence`` (both inclusive). The comparison runs at
+    the published precision (ADR-0004 A4): both values are rounded to 4 decimal
+    places, the precision of the JSON output, so a confidence copied from the
+    output into ``min_confidence`` always gates. Range validation of
+    ``min_confidence`` applies to the raw value. A node is a
     violation when it has at least one gating finding. Findings at or above
     the risk threshold whose confidence falls below ``min_confidence`` are
     *suppressed*: collected (risk descending, then node name, then column),
@@ -69,7 +75,7 @@ def evaluate_gate(
         for finding in node.findings.values():
             if RISK_RANK[finding.risk] < threshold:
                 continue
-            if finding.confidence >= min_confidence:
+            if round(finding.confidence, 4) >= round(min_confidence, 4):
                 gating = True
             else:
                 suppressed.append((node.name, node.node_id, finding))

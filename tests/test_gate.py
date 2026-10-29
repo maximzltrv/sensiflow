@@ -229,3 +229,10 @@ def test_gate_over_mock_graph_excludes_pure_origins_at_low() -> None:
     violating = {n.node_id for n in outcome.violations}
     assert "raw_customers" not in violating  # ORIGIN ranks below LOW
     assert {"mart_orders_enriched", "stg_customers", "dim_customers"} <= violating
+
+
+def test_confidence_compared_at_published_precision() -> None:
+    # 0.8 * 0.7 == 0.5599999999999999 in floats but is published as 0.56 (A4).
+    result = _result(_node("n", _finding("email", "LOW", 0.8 * 0.7)))
+    assert evaluate_gate(result, fail_on="LOW", min_confidence=0.56).tripped
+    assert not evaluate_gate(result, fail_on="LOW", min_confidence=0.5601).tripped
