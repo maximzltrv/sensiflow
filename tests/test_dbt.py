@@ -220,6 +220,17 @@ def test_invalid_json(tmp_path: Path) -> None:
         DbtSource(path).build_graph()
 
 
+def test_manifest_with_non_utf8_bytes_is_input_error(tmp_path: Path) -> None:
+    path = tmp_path / "manifest.json"
+    path.write_bytes(b'{"nodes": {"caf\xe9": {}}}')  # latin-1 bytes
+    with pytest.raises(SensiflowInputError, match="not valid UTF-8") as excinfo:
+        DbtSource(path).build_graph()
+    message = str(excinfo.value)
+    assert str(path) in message
+    assert "UnicodeDecodeError" not in message  # no traceback class leakage
+    assert excinfo.value.__cause__ is None  # raised `from None`
+
+
 def test_json_but_not_a_manifest(tmp_path: Path) -> None:
     path = tmp_path / "manifest.json"
     path.write_text(json.dumps({"foo": 1}))

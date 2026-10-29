@@ -129,9 +129,14 @@ class DbtSource:
 
     def _load(self) -> dict[str, Any]:
         try:
-            text = self._path.read_text()
+            # dbt writes manifest.json as UTF-8; anything else is not a manifest.
+            text = self._path.read_text(encoding="utf-8")
         except FileNotFoundError:
             raise SensiflowInputError(f"dbt manifest not found: {self._path}") from None
+        except UnicodeDecodeError:
+            raise SensiflowInputError(
+                f"dbt manifest {self._path}: not valid UTF-8"
+            ) from None
         except OSError as exc:
             raise SensiflowInputError(
                 f"cannot read dbt manifest {self._path}: {exc.strerror}"

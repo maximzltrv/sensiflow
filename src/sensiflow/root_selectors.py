@@ -141,21 +141,27 @@ def load_roots_file(path: str | Path) -> GraphSelection:
     file_path = Path(path)
     try:
         size = file_path.stat().st_size
-        if size > _MAX_ROOTS_FILE_BYTES:
-            # Raised inside the try on purpose: SensiflowInputError matches
-            # none of the clauses below, so it propagates untouched.
-            raise SensiflowInputError(
-                f"roots file {file_path} is {size} bytes — larger than the "
-                f"{_MAX_ROOTS_FILE_BYTES} byte (1 MiB) limit"
-            )
-        text = file_path.read_text(encoding="utf-8")
     except FileNotFoundError:
         raise SensiflowInputError(f"roots file not found: {file_path}") from None
+    except OSError as exc:
+        raise SensiflowInputError(
+            f"cannot read roots file {file_path}: {exc.strerror}"
+        ) from None
+    if size > _MAX_ROOTS_FILE_BYTES:
+        raise SensiflowInputError(
+            f"roots file {file_path} is {size} bytes — larger than the "
+            f"{_MAX_ROOTS_FILE_BYTES} byte (1 MiB) limit"
+        )
+
+    try:
+        text = file_path.read_text(encoding="utf-8")
     except UnicodeDecodeError:
         raise SensiflowInputError(
             f"roots file {file_path}: not valid UTF-8"
         ) from None
     except OSError as exc:
+        # stat() above already rules out a missing file (bar a race); this
+        # catches unreadable paths, e.g. a directory.
         raise SensiflowInputError(
             f"cannot read roots file {file_path}: {exc.strerror}"
         ) from None

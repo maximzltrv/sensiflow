@@ -316,3 +316,20 @@ def test_missing_pyyaml_raises_dependency_error() -> None:
 
     with pytest.raises(SensiflowDependencyError, match=r"sensiflow\[yaml\]"):
         _require_yaml(import_module=failing_import)
+
+
+def test_safe_load_is_the_only_yaml_entry_point() -> None:
+    # Heuristic grep guard, not a proof: substring matching over src/ to catch
+    # a careless regression to PyYAML's unsafe constructors. `.load(` cannot
+    # false-positive on `safe_load(` (that contains `_load(`, not `.load(`).
+    src_root = Path(__file__).parent.parent / "src" / "sensiflow"
+    sources = {path: path.read_text() for path in sorted(src_root.rglob("*.py"))}
+    assert sources, "src/sensiflow not found — test layout changed?"
+
+    loader_text = sources[src_root / "root_selectors.py"]
+    assert "safe_load" in loader_text
+
+    forbidden = (".load(", ".full_load(", ".unsafe_load(", "FullLoader", "UnsafeLoader")
+    for path, text in sources.items():
+        for token in forbidden:
+            assert token not in text, f"{path}: forbidden YAML API {token!r}"
