@@ -266,6 +266,28 @@ def test_from_seeds_without_any_pii_tags_is_input_error() -> None:
         make_source(handler).build_graph(GraphSelection(from_seeds=True))
 
 
+def test_listing_skips_malformed_entries() -> None:
+    # The /tables payload is untrusted: a non-dict item, a missing FQN, and an
+    # empty FQN must be skipped, never crash the listing (security finding).
+    junk: list[Any] = ["not-a-dict", {"name": "no_fqn_here"}, {"fullyQualifiedName": ""}]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/tables":
+            return httpx.Response(200, json={"data": junk + TABLES, "paging": {}})
+        return _handler(request)
+
+    source = make_source(handler)
+    graph = source.build_graph(GraphSelection(patterns=("mart_customer_*",)))
+    assert set(graph.nodes) == {
+        f"{PREFIX}.mart_customer_dump",
+        f"{PREFIX}.dim_customers",
+        f"{PREFIX}.stg_customers",
+        f"{PREFIX}.raw_customers",
+    }
+    # The full scan shares _list_tables and must survive the same payload.
+    assert len(source.build_graph().nodes) == 7
+
+
 # --- end to end through the engine ---------------------------------------------
 
 

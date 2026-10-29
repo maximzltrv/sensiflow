@@ -239,7 +239,12 @@ class OpenMetadataSource:
     def _list_tables(
         self, client: httpx.Client, *, fields: str | None
     ) -> list[dict[str, Any]]:
-        """One paginated pass over /tables; ``fields=None`` keeps the payload light."""
+        """One paginated pass over /tables; ``fields=None`` keeps the payload light.
+
+        The payload is untrusted: entries that are not mappings or lack a
+        non-empty ``fullyQualifiedName`` are skipped, so one malformed catalog
+        entry never aborts the listing.
+        """
         tables: list[dict[str, Any]] = []
         after: str | None = None
         while True:
@@ -249,7 +254,11 @@ class OpenMetadataSource:
             if after:
                 params["after"] = after
             payload = self._get(client, "/tables", params)
-            tables.extend(payload.get("data") or [])
+            tables.extend(
+                entry
+                for entry in payload.get("data") or []
+                if isinstance(entry, dict) and entry.get("fullyQualifiedName")
+            )
             after = (payload.get("paging") or {}).get("after")
             if not after:
                 break

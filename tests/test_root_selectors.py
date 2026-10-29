@@ -281,6 +281,32 @@ def test_violation_messages_name_the_file(tmp_path: Path) -> None:
         load_roots_file(path)
 
 
+def test_non_utf8_file_is_input_error(tmp_path: Path) -> None:
+    path = tmp_path / "roots.yaml"
+    path.write_bytes(b"version: 1\nroots:\n  - id: caf\xe9\n")  # latin-1 bytes
+    with pytest.raises(SensiflowInputError, match="not valid UTF-8"):
+        load_roots_file(path)
+
+
+def test_invalid_yaml_message_never_leaks_file_contents(tmp_path: Path) -> None:
+    # If the "YAML" is really a credentials file passed by mistake, the error
+    # message must not echo its contents (MarkedYAMLError's str() would).
+    sentinel = "sample_secret_sentinel_AKIA0000"
+    path = write_roots(tmp_path, f"password: [{sentinel}\n")  # unclosed flow seq
+    with pytest.raises(SensiflowInputError, match="invalid YAML") as excinfo:
+        load_roots_file(path)
+    message = str(excinfo.value)
+    assert sentinel not in message
+    assert "line" in message  # coordinates survive; contents do not
+
+
+def test_file_over_the_size_cap_is_refused_before_parsing(tmp_path: Path) -> None:
+    path = tmp_path / "roots.yaml"
+    path.write_bytes(b"#" * (1024 * 1024 + 1))
+    with pytest.raises(SensiflowInputError, match=r"1 MiB.*limit|limit.*1 MiB"):
+        load_roots_file(path)
+
+
 # --- lazy PyYAML dependency --------------------------------------------------------
 
 

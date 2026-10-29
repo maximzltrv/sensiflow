@@ -23,6 +23,9 @@ from sensiflow.exceptions import SensiflowDependencyError, SensiflowInputError
 #: fnmatch metacharacters; their presence classifies a value as a pattern.
 _GLOB_CHARS = ("*", "?", "[")
 
+#: refuse roots files larger than this before parsing (alias-expansion DoS guard).
+_MAX_ROOTS_FILE_BYTES = 1024 * 1024
+
 
 def has_glob_chars(value: str) -> bool:
     """True when ``value`` contains an fnmatch metacharacter (``*``, ``?``, ``[``)."""
@@ -137,9 +140,21 @@ def load_roots_file(path: str | Path) -> GraphSelection:
     yaml_mod = _require_yaml()
     file_path = Path(path)
     try:
-        text = file_path.read_text()
+        size = file_path.stat().st_size
+        if size > _MAX_ROOTS_FILE_BYTES:
+            # Raised inside the try on purpose: SensiflowInputError matches
+            # none of the clauses below, so it propagates untouched.
+            raise SensiflowInputError(
+                f"roots file {file_path} is {size} bytes — larger than the "
+                f"{_MAX_ROOTS_FILE_BYTES} byte (1 MiB) limit"
+            )
+        text = file_path.read_text(encoding="utf-8")
     except FileNotFoundError:
         raise SensiflowInputError(f"roots file not found: {file_path}") from None
+    except UnicodeDecodeError:
+        raise SensiflowInputError(
+            f"roots file {file_path}: not valid UTF-8"
+        ) from None
     except OSError as exc:
         raise SensiflowInputError(
             f"cannot read roots file {file_path}: {exc.strerror}"
@@ -148,8 +163,16 @@ def load_roots_file(path: str | Path) -> GraphSelection:
     try:
         payload = yaml_mod.safe_load(text)
     except yaml_mod.YAMLError as exc:
+        # Never interpolate the exception itself: MarkedYAMLError's str()
+        # embeds a snippet of the file CONTENTS, which may not be YAML at all
+        # (e.g. a credentials file passed by mistake). Problem text and
+        # line/column numbers only — never str(mark), it carries the snippet.
+        detail = getattr(exc, "problem", None) or type(exc).__name__
+        mark = getattr(exc, "problem_mark", None)
+        if mark is not None:
+            detail = f"{detail} (line {mark.line + 1}, column {mark.column + 1})"
         raise SensiflowInputError(
-            f"roots file {file_path}: invalid YAML: {exc}"
+            f"roots file {file_path}: invalid YAML: {detail}"
         ) from None
 
     def fail(violation: str) -> SensiflowInputError:
