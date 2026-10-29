@@ -13,12 +13,17 @@ from __future__ import annotations
 
 import importlib
 from collections import deque
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from types import ModuleType
 from typing import TYPE_CHECKING, Any
 
-from sensiflow.exceptions import SensiflowConnectionError, SensiflowDependencyError
+from sensiflow.exceptions import (
+    SensiflowConnectionError,
+    SensiflowDependencyError,
+    SensiflowInputError,
+)
 from sensiflow.model import LineageGraph, Node, PiiTag
+from sensiflow.root_selectors import GraphSelection, resolve_patterns
 
 if TYPE_CHECKING:
     import httpx
@@ -43,8 +48,8 @@ def _require_httpx(
         ) from exc
 
 
-def _node_from_table(table: dict[str, Any], upstream: list[str]) -> Node:
-    """Map an OMD table entity onto a sensiflow Node (ADR-0002 §3-§4)."""
+def _declared_pii(table: dict[str, Any]) -> dict[str, PiiTag]:
+    """Columns of an OMD table entity carrying a PII.* tag (ADR-0002 §4)."""
     declared: dict[str, PiiTag] = {}
     for column in table.get("columns") or []:
         for tag in column.get("tags") or []:
@@ -53,7 +58,11 @@ def _node_from_table(table: dict[str, Any], upstream: list[str]) -> Node:
                 declared[column["name"]] = PiiTag(category="pii", sensitive=True)
             elif tag_fqn == "PII.NonSensitive":
                 declared[column["name"]] = PiiTag(category="pii", sensitive=False)
+    return declared
 
+
+def _node_from_table(table: dict[str, Any], upstream: list[str]) -> Node:
+    """Map an OMD table entity onto a sensiflow Node (ADR-0002 §3-§4)."""
     owners: list[str] = []
     for owner in table.get("owners") or []:
         label = owner.get("email") or owner.get("name") or owner.get("displayName")
@@ -71,7 +80,7 @@ def _node_from_table(table: dict[str, Any], upstream: list[str]) -> Node:
         owners=owners,
         upstream=upstream,
         sql=sql,
-        declared_pii=declared,
+        declared_pii=_declared_pii(table),
     )
 
 
@@ -96,13 +105,7 @@ class OpenMetadataSource:
 
     # -- public API ---------------------------------------------------------
 
-    def build_graph(
-        self,
-        roots: Sequence[str] | None = None,
-        *,
-        upstream_depth: int | None = None,
-        downstream_depth: int | None = None,
-    ) -> LineageGraph:
+    def build_graph(self, selection: GraphSelection | None = None) -> LineageGraph:
         httpx_mod = _require_httpx()
         client = httpx_mod.Client(
             base_url=f"{self.host}/api/v1",
@@ -111,11 +114,48 @@ class OpenMetadataSource:
             transport=self._transport,
         )
         try:
-            if roots:
-                return self._walk(client, list(roots), upstream_depth, downstream_depth)
-            return self._full_scan(client)
+            if selection is None or selection.is_full_scan():
+                return self._full_scan(client)
+            return self._walk(
+                client,
+                self._resolve_selection(client, selection),
+                selection.upstream_depth,
+                selection.downstream_depth,
+            )
         finally:
             client.close()
+
+    def _resolve_selection(
+        self, client: httpx.Client, selection: GraphSelection
+    ) -> list[str]:
+        """Resolve the selection to concrete root FQNs (ADR-0002 amendment A5).
+
+        Exact roots keep the listing-free path. Patterns and from-seeds cost
+        one paginated pass over /tables (from-seeds with ``fields=columns,tags``
+        so PII markup is visible); the lineage walk then fetches only the
+        matched closures.
+        """
+        if selection.from_seeds:
+            tables = self._list_tables(client, fields="columns,tags")
+            seeded = sorted(
+                table["fullyQualifiedName"] for table in tables if _declared_pii(table)
+            )
+            if not seeded:
+                raise SensiflowInputError(
+                    f"--roots-from-seeds found no PII-tagged tables at {self.host}; "
+                    "sensiflow needs declared PII markup to trace from "
+                    "(ADR-0001 applicability precondition)"
+                )
+            return seeded
+        resolved = list(selection.roots)
+        if selection.patterns:
+            candidates = [
+                (table["fullyQualifiedName"], table.get("name") or "")
+                for table in self._list_tables(client, fields=None)
+            ]
+            resolved.extend(resolve_patterns(selection.patterns, candidates))
+        # One node matched by several selectors appears once (A2).
+        return list(dict.fromkeys(resolved))
 
     # -- graph construction (ADR-0002 §3) -----------------------------------
 
@@ -185,18 +225,7 @@ class OpenMetadataSource:
 
     def _full_scan(self, client: httpx.Client) -> LineageGraph:
         cache: _EdgeCache = {}
-        tables: list[dict[str, Any]] = []
-        after: str | None = None
-        while True:
-            params: dict[str, Any] = {"fields": _TABLE_FIELDS, "limit": _PAGE_LIMIT}
-            if after:
-                params["after"] = after
-            payload = self._get(client, "/tables", params)
-            tables.extend(payload.get("data") or [])
-            after = (payload.get("paging") or {}).get("after")
-            if not after:
-                break
-
+        tables = self._list_tables(client, fields=_TABLE_FIELDS)
         nodes: dict[str, Node] = {}
         for table in tables:
             fqn = table["fullyQualifiedName"]
@@ -206,6 +235,34 @@ class OpenMetadataSource:
         return LineageGraph(nodes=nodes)
 
     # -- OMD endpoints -------------------------------------------------------
+
+    def _list_tables(
+        self, client: httpx.Client, *, fields: str | None
+    ) -> list[dict[str, Any]]:
+        """One paginated pass over /tables; ``fields=None`` keeps the payload light.
+
+        The payload is untrusted: entries that are not mappings or lack a
+        non-empty ``fullyQualifiedName`` are skipped, so one malformed catalog
+        entry never aborts the listing.
+        """
+        tables: list[dict[str, Any]] = []
+        after: str | None = None
+        while True:
+            params: dict[str, Any] = {"limit": _PAGE_LIMIT}
+            if fields:
+                params["fields"] = fields
+            if after:
+                params["after"] = after
+            payload = self._get(client, "/tables", params)
+            tables.extend(
+                entry
+                for entry in payload.get("data") or []
+                if isinstance(entry, dict) and entry.get("fullyQualifiedName")
+            )
+            after = (payload.get("paging") or {}).get("after")
+            if not after:
+                break
+        return tables
 
     def _fetch_table(self, client: httpx.Client, fqn: str) -> dict[str, Any]:
         return self._get(client, f"/tables/name/{fqn}", {"fields": _TABLE_FIELDS})

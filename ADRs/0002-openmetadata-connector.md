@@ -1,7 +1,9 @@
 # ADR-0002: OpenMetadata connector — thin REST client behind an optional extra
 
 - **Status:** Accepted (2026-09-16, after author review; amendments during
-  review: multi-root walk, per-direction depth limits, truncation warnings)
+  review: multi-root walk, per-direction depth limits, truncation warnings);
+  amended 2026-10-29: root selectors (Accepted 2026-10-29, after review:
+  lazy pyyaml extra, strict zero-match, `GraphSelection` spec object)
 - **Date:** 2026-08-27
 - **Deciders:** Maksim Zolotarev
 
@@ -216,3 +218,399 @@ source so the zero-config demo keeps working.
 4. **Building the graph from column-level lineage edges.** OMD's column
    lineage coverage is inconsistent across ingestion sources; committing to
    it now would make graph shape depend on catalog hygiene. Deferred.
+
+---
+
+## Amendment (2026-10-29): root selectors
+
+- **Status:** Accepted (2026-10-29, after team-lead review)
+
+### Context
+
+§3 made `roots` a list of exact table FQNs. In practice users scope a run to
+"everything under this schema" or "every table that carries PII markup", and
+typing dozens of FQNs by hand does not scale — nor does falling back to the
+full-catalog scan, which §3 documents as expensive. ADR-0003 §5 reuses the
+roots/depth semantics for the dbt connector (adding unambiguous bare-name
+resolution), so whatever selection mechanism we add must be defined once and
+govern **every** `LineageSource`, not just OpenMetadata.
+
+This amendment therefore owns root *selection* for all connectors, present and
+future. It deliberately ships before the planned `check` CI-gate command: CI
+is the primary consumer of "select roots without enumerating them", and the
+gate should land on top of a settled selection model rather than force it.
+
+### Decision
+
+#### A1. Three selector forms
+
+1. **Glob patterns in `--root`.** A `--root` value containing any of the
+   fnmatch metacharacters `*`, `?`, `[` is treated as a pattern; a value
+   without them keeps today's exact semantics unchanged (OMD: table FQN;
+   dbt: `unique_id` or unambiguous bare name per ADR-0003 §5). Matching uses
+   `fnmatch.fnmatchcase` (case-sensitive, deterministic across platforms):
+   `*` and `?` wildcards, `[seq]`/`[!seq]` classes. There is no path/segment
+   awareness — `demo.wh.*` matches the entire subtree at any depth, which is
+   the intended reading for lineage scoping.
+
+   A pattern matches a node when it matches the node **id** (FQN /
+   `unique_id`) **or** the bare node name — consistent with the bare-name
+   convenience ADR-0003 §5 already established for exact roots. So
+   `--root 'raw_*'` works on both connectors without knowing FQN prefixes.
+
+   Edge case, accepted: a literal id that itself contains `*`, `?`, or `[`
+   cannot be addressed as an exact root (it will be classified as a pattern).
+   fnmatch's `[[]` class can escape a literal `[`; ids containing `*`/`?` are
+   considered pathological and unsupported in v1.
+
+2. **`--roots-from-seeds`.** Every node that carries declared PII markup
+   (non-empty `declared_pii`) becomes a root. This is the natural CI shape:
+   "trace everything that originates PII, wherever it is." A useful property:
+   since every root is itself a seed, the dangerous upstream-truncation
+   warning of §3 can never fire on such runs — the seeds are in the graph by
+   construction, and `--upstream-depth 0` becomes a safe, cheap default for
+   CI (nodes upstream of seeds cannot contribute findings).
+
+3. **`--roots-file PATH`.** Roots from a YAML file with the fixed, versioned
+   schema pinned in A3. The file is the reviewable, checked-in form of a
+   team's scoping baseline; `--root` remains the ad-hoc form.
+
+#### A2. Mixing rules
+
+- `--root` (repeatable) and `--roots-file` **combine as a union**: both are
+  identity-based selection, and "checked-in baseline plus ad-hoc additions"
+  is the natural workflow. Duplicates (one node matched by several selectors)
+  are deduplicated after resolution.
+- `--roots-from-seeds` is **mutually exclusive** with `--root` and
+  `--roots-file` → `SensiflowInputError`. It selects by a *property* of the
+  data, not by identity; mixing the two regimes would blur root provenance
+  and the error semantics (a "no seeds found" failure could be silently
+  masked by an explicit root, and vice versa). A future need to combine them
+  can relax this; starting exclusive keeps every run's meaning obvious.
+- `--roots-file` is accepted at most once in v1. Making it repeatable (union
+  of files) is a trivial future extension; silently letting argparse keep
+  the last occurrence would be a footgun, so a repeat is rejected.
+
+#### A3. The roots file: fixed YAML schema, version 1
+
+```yaml
+# roots.yaml — sensiflow root selectors
+version: 1
+roots:
+  - id: demo.wh.sales.orders     # exact node id (connector's exact semantics)
+  - pattern: "demo.wh.crm.*"     # fnmatch glob against node id and bare name
+  - pattern: "raw_*"             # bare-name glob
+```
+
+Strict validation — every violation raises `SensiflowInputError` naming the
+file and the exact problem:
+
+| Rule | Message gist |
+|------|--------------|
+| File must exist and be readable | `roots file not found: PATH` |
+| Must parse as YAML (`yaml.safe_load`) | `roots file PATH: invalid YAML: <problem (line, column)>` — see hardening addendum |
+| Top level must be a mapping with exactly the keys `version` and `roots` | unknown top-level key `X` rejected |
+| `version` must be the integer `1` | `unsupported roots-file version: X (supported: 1)` |
+| `roots` must be a non-empty list | `'roots' must be a non-empty list` |
+| Each entry must be a mapping with exactly one key, `id` or `pattern` | unknown entry key `X` / entry with 0 or 2+ keys rejected |
+| Values must be non-empty strings | type and emptiness checked |
+| An `id` value must not contain `*`, `?`, `[` | "glob characters in 'id' entry — use 'pattern'" |
+| A `pattern` value must contain at least one of `*`, `?`, `[` | "no glob characters in 'pattern' entry — use 'id'" |
+
+The last two rules keep the file lossless: `id` entries map 1:1 onto
+`GraphSelection.roots` and `pattern` entries onto `GraphSelection.patterns`
+(A4), with no ambiguity about which entry was meant as exact and which as a
+pattern. Both kinds fail hard when they resolve to nothing (A6), so the
+distinction does not change failure behavior — its value is message
+precision ("unknown root id 'X'" vs "root pattern 'X' matched no tables"). There
+is deliberately no second way to express anything — no free-form sections, no
+per-entry options. Future needs (per-root depths, comments beyond YAML `#`)
+require a `version: 2` and a new review, not schema creep.
+
+**Hardening addendum (2026-10-29, from the implementation review rounds).**
+The shipped loader tightens the pinned schema in four ways, all strictly
+narrowing what is accepted:
+
+- the roots file must be valid UTF-8 (`UnicodeDecodeError` →
+  `SensiflowInputError` "not valid UTF-8");
+- files larger than 1 MiB are rejected before reading or parsing (an
+  alias-expansion/DoS guard — a legitimate roots file is orders of
+  magnitude smaller);
+- invalid-YAML messages are sanitized: built from the parser's problem text
+  plus line/column only, never the raw exception string, which can embed a
+  snippet of the file contents (dangerous when a non-YAML file — e.g. a
+  credentials file — is passed by mistake);
+- a heuristic guard test pins `yaml.safe_load` as the only YAML entry point
+  in the codebase (the lazy-import indirection of A8 defeats linter-based
+  detection, so the test greps the source).
+
+The same UTF-8 rule was applied to the dbt manifest loader (ADR-0003 §2's
+defensive parsing) for consistency; deliberately **no** size cap there —
+multi-megabyte manifests are legitimate dbt output.
+
+#### A4. Where resolution lives: a shared selector layer
+
+A new module `src/sensiflow/root_selectors.py` — a sibling of
+`graph_scope.py`, i.e. source-adjacent shared infrastructure, invisible to
+the engine — owns the selection spec object, the file loader, and the
+matching rules, so dbt and OMD cannot drift apart.
+
+**The spec object.** The entire graph-scoping request is one frozen,
+keyword-constructed dataclass:
+
+```python
+@dataclass(frozen=True)
+class GraphSelection:
+    roots: tuple[str, ...] = ()        # exact node ids (connector's exact semantics)
+    patterns: tuple[str, ...] = ()     # fnmatch globs against node id and bare name
+    from_seeds: bool = False           # every PII-seeded node becomes a root
+    upstream_depth: int | None = None  # None = unlimited, 0 = direction disabled
+    downstream_depth: int | None = None
+```
+
+Depths live **inside** the object, deliberately: they describe the same
+graph-scoping request as the roots (truncation semantics are defined per
+union of roots, §3), and folding every scoping knob into one value is what
+makes the method signature permanently stable. Validation happens at
+construction (`__post_init__`) — fail early, in exactly one place, shared
+by CLI, file loader, and library callers:
+
+- `from_seeds=True` with non-empty `roots`/`patterns` →
+  `SensiflowInputError` (the A2 exclusivity rule, enforced at the source of
+  truth rather than in the CLI);
+- `roots` entries must be non-empty strings without glob metacharacters
+  ("use patterns"); `patterns` entries must contain at least one
+  metacharacter ("use roots") — the same two rules as the YAML schema (A3);
+- depths must be `None` or `>= 0`, and a depth given on an otherwise-empty
+  selection is rejected ("depths require roots"): a full scan has no roots
+  to measure hops from;
+- `GraphSelection()` (all defaults) is valid and means "full scan",
+  equivalent to passing `None`.
+
+**The final protocol shape** (the last signature revision after
+`build_graph(root)` and `build_graph(roots, *, depths...)` — all three
+in-repo sources and the CLI migrate in the same change; the protocol still
+has no external implementors, so this is the moment to spend the last cheap
+break):
+
+```python
+class LineageSource(Protocol):
+    def build_graph(self, selection: GraphSelection | None = None) -> LineageGraph: ...
+```
+
+**The protocol is now shape-stable: future extensions add OPTIONAL fields
+(with defaults) to `GraphSelection`, never parameters to `build_graph`.**
+Library ergonomics stay terse: `build_graph()` is the full scan,
+`build_graph(GraphSelection(roots=("demo.wh.sales.orders",)))` the common
+case. `MockSource` accepts and ignores the selection (fixed graph), as it
+did with the old parameters.
+
+**Supporting functions** in the same module:
+
+- `load_roots_file(path) -> GraphSelection`: parse + strict validation
+  (A3), returning a selection with `roots`/`patterns` populated and every
+  other field at its default. The CLI combines it with flag-derived values
+  (union of roots and patterns per A2, depths from flags) into the final
+  object; no public merge API is promised in v1.
+- `resolve_patterns(patterns, candidates) -> list[str]`: fnmatch resolution
+  against an iterable of `(id, name)` candidate pairs, producing matched
+  node ids; a pattern that matches nothing raises `SensiflowInputError`
+  (A6).
+
+CLI flags map 1:1 onto the object: each `--root` value is classified by the
+metacharacter test into `roots` or `patterns`, `--roots-file` contributes
+via the loader, `--roots-from-seeds` sets `from_seeds`, and the depth flags
+set the depth fields. `GraphSelection` is public API, exported from the
+package root alongside the model dataclasses.
+
+#### A5. Per-connector resolution cost — stated honestly
+
+- **dbt:** free. The whole manifest is already in memory; candidates are all
+  graph vertices, resolution is an in-memory filter, and scoping remains the
+  `graph_scope.scope_graph` post-filter of ADR-0003 §5.
+- **OpenMetadata:** exact-FQN roots keep today's listing-free path (straight
+  to the lineage endpoint). Any pattern selector or `from_seeds=True`
+  first requires **one paginated pass over `/api/v1/tables`** to obtain
+  candidate FQNs/names (and, for from-seeds, column tags — a heavier payload
+  since `fields=columns,tags` must be requested). After resolution, the
+  normal multi-root BFS of §3 fetches lineage **only for the matched
+  closures**. Cost ordering: exact roots < pattern/from-seeds (one listing
+  pass + matched closures) < full scan (listing + lineage for every table).
+  This is documented behavior, not an implementation detail: on large
+  catalogs the listing pass is O(tables / page size) requests.
+- **OMD asymmetry, accepted:** exact (non-glob) roots on OMD remain FQNs
+  only — resolving bare names exactly would itself require the listing pass,
+  defeating the cheap path. Users who want bare-name addressing on OMD use a
+  pattern; dbt keeps its unambiguous bare-name resolution for exact roots.
+
+#### A6. Error and warning semantics
+
+- **Unknown exact root:** error, unchanged (dbt: `SensiflowInputError` with
+  the candidate list when ambiguous; OMD: the existing 404 handling).
+- **A pattern matching zero nodes:** a hard `SensiflowInputError` ("root
+  pattern 'X' matched no tables"), even when other selectors did match.
+  Decided strict during review (2026-10-29): a softer warning mode was
+  considered and rejected — a silently empty pattern would be dangerous
+  under the planned `check` CI gate (a typo could greenlight a pipeline),
+  and relaxing an error into a warning later is a cheap, compatible change,
+  whereas tightening a warning into an error breaks existing users. No
+  leniency debt is taken on without a demonstrated benefit.
+- Because every selector must resolve (exact roots must exist, patterns must
+  match at least one node), an empty resolved root set cannot occur; in
+  particular there is **no fallback to full scan** — silently converting a
+  typo into the most expensive possible run would be hostile (see
+  alternative 7).
+- **`--roots-from-seeds` finds zero seeds:** `SensiflowInputError` stating
+  that no PII-seeded tables exist and pointing at the applicability
+  precondition of ADR-0001. This is a hard error, not the ADR-0001 "no seeds
+  anywhere" report warning: the user explicitly asked for seed-derived
+  roots, so an empty result is an unanswerable request, not a valid report.
+- **Roots file problems:** `SensiflowInputError` per the A3 table.
+
+#### A7. Depths and truncation: unchanged
+
+`--upstream-depth` / `--downstream-depth` and the truncation-warning
+obligations of §3 apply exactly as before, to the **union of resolved
+roots** — selectors change only how the root set is produced, never what
+walking from it means. ADR-0003 §5's in-memory implementation is unaffected
+for the same reason.
+
+#### A8. Dependency: PyYAML behind an optional extra, lazily imported
+
+The roots file needs a YAML parser; the standard library has none. PyYAML
+(`pyyaml>=6`) is added as an **optional extra**, mirroring the `httpx`
+pattern of §1–§2 of this ADR:
+
+```toml
+[project.optional-dependencies]
+yaml = ["pyyaml>=6"]
+```
+
+The import happens lazily inside the roots-file loader; if PyYAML is not
+installed, `--roots-file` raises `SensiflowDependencyError` naming the exact
+fix: `pip install 'sensiflow[yaml]'`. The base dependency set stays
+unchanged (`sqlglot` only) — the "single-dependency base install"
+consequence recorded in this ADR and ADR-0003 continues to hold. Loading
+uses `yaml.safe_load` only; `types-PyYAML` joins the dev group for strict
+mypy. Glob patterns and `--roots-from-seeds` need no extra — only the file
+form pays the install step.
+
+#### A9. CLI surface after this amendment (supersedes §7's listing)
+
+```
+sensiflow report --source mock
+sensiflow report --source openmetadata --omd-host H --omd-token T
+                 [--root FQN_OR_GLOB ...] [--roots-file PATH | --roots-from-seeds]
+                 [--upstream-depth N] [--downstream-depth M]
+sensiflow report --source dbt --dbt-manifest PATH
+                 [--root ID_OR_GLOB ...] [--roots-file PATH | --roots-from-seeds]
+                 [--upstream-depth N] [--downstream-depth M]
+```
+
+Examples:
+
+```
+# everything under one schema (quote the glob — the shell must not expand it)
+sensiflow report --source openmetadata --omd-host H --omd-token T \
+    --root 'demo.wh.crm.*'
+
+# checked-in baseline plus one ad-hoc root
+sensiflow report --source dbt --dbt-manifest target/manifest.json \
+    --roots-file roots.yaml --root model.demo.stg_payments
+
+# every PII-seeded table, downstream exposure only
+sensiflow report --source dbt --dbt-manifest target/manifest.json \
+    --roots-from-seeds --upstream-depth 0
+
+# future-facing (once the `check` command exists) — the intended CI one-liner:
+sensiflow check --source dbt --dbt-manifest target/manifest.json \
+    --roots-from-seeds --fail-on HIGH
+```
+
+The `check` example is documentation of intent, not part of this slice.
+
+### Consequences
+
+Positive:
+
+- Scoping a run no longer requires enumerating FQNs or paying for a full
+  scan; `--roots-from-seeds` gives CI a configuration-free root set.
+- One shared resolution module keeps selector semantics identical across
+  connectors and trivially available to future ones.
+- The rigid roots-file schema is reviewable in PRs and versioned from day
+  one; schema evolution has an explicit gate (`version: 2`).
+
+Negative / accepted trade-offs:
+
+- `--roots-file` requires an extra install step (`sensiflow[yaml]`); the
+  dependency-missing error names the fix (A8).
+- Patterns and from-seeds on OMD cost a full table-listing pass; documented,
+  and still cheaper than the full scan.
+- Strict zero-match semantics (A6) mean multi-environment roots files must
+  only contain patterns that match everywhere they are used; a leniency
+  mode, if ever justified, is a compatible relaxation.
+- fnmatch is case-sensitive and not segment-aware; both are documented
+  behaviors rather than options (no new knobs in v1).
+- Exact bare-name roots remain dbt-only (A5 asymmetry).
+- One more (and final) `build_graph` signature change, spent deliberately on
+  the `GraphSelection` object so the protocol never changes shape again;
+  all in-repo sources and the CLI migrate in the same change.
+
+### Alternatives considered
+
+1. **Regular expressions instead of globs.** More powerful, but the `.`
+   metacharacter is a footgun in a dotted-FQN world (`demo.wh.crm.*` as a
+   regex quietly matches more than intended), and shell/dbt users already
+   think in globs. A `re:PATTERN` prefix remains the compatible escape hatch
+   if globs ever prove insufficient — **rejected for now**, not forever;
+   adding it later breaks nothing.
+2. **dbt-style graph selectors (`+model+`, `tag:pii`, …).** Expressive, but
+   it is a selector mini-language to parse, document, and maintain; its
+   graph-walk operators (`+model+`) duplicate what `--upstream-depth` /
+   `--downstream-depth` already express; and its tag/package operators are
+   connector-specific concepts that would leak through the source-agnostic
+   `LineageSource` seam. Revisit only on demonstrated demand.
+3. **Plain text roots file (one selector per line).** No versioning, no
+   explicit exact-vs-pattern distinction, and an open invitation to grow
+   ad-hoc syntax (comments, prefixes) without a schema gate. Rejected.
+4. **JSON or TOML instead of YAML for the roots file.** JSON lacks comments —
+   unacceptable for a checked-in, reviewed config. TOML (stdlib `tomllib`)
+   would avoid the PyYAML dependency but is an unusual choice for list-heavy
+   data-engineering config, where YAML is the established convention (dbt,
+   catalog ingestion). Rejected in favor of YAML plus the A8 extra.
+5. **PyYAML as a core dependency.** Simpler UX (no extra to install for
+   `--roots-file`) for a tiny, ubiquitous package — but it breaks the
+   single-dependency base install recorded in two accepted ADRs for an
+   opt-in convenience feature, and the connector-extra precedent (§1–§2)
+   already gives users a well-understood install-hint pattern. Rejected in
+   review (2026-10-29) in favor of the lazy-optional extra (A8).
+6. **A `seeds:` magic selector string instead of the `from_seeds` field.**
+   Rejected: it squats in the id namespace and hides a mode switch inside
+   data.
+7. **Fallback to full scan when selectors match nothing.** Rejected: it
+   converts a typo into the most expensive run the connector can make and
+   masks the error.
+8. **Keep growing keyword parameters on `build_graph`** (add
+   `roots_from_seeds: bool` next to the existing four). Smallest immediate
+   diff, but every future scoping feature would change the protocol
+   signature again — against every implementor, forever. Rejected in review
+   (2026-10-29) in favor of spending one final signature change on the
+   `GraphSelection` object (A4), after which extensions are optional fields
+   on the object, not method parameters.
+
+### Review notes (2026-10-29)
+
+Resolved during review:
+
+1. PyYAML ships as a lazy-optional extra, not a core dependency (A8,
+   alternative 5).
+2. Zero-match patterns fail hard from v1 (A6); the warning mode was
+   rejected.
+3. Case-sensitive matching only in v1 — confirmed.
+4. `--roots-file` accepted at most once per invocation — confirmed.
+5. The last pre-stability signature change is spent on the `GraphSelection`
+   spec object (A4, alternative 8): `build_graph(selection=None)` is the
+   final shape. Rationale: upcoming work (CI gate, write-back, deployment
+   and agent interfaces) builds on top of this protocol, so it must stop
+   moving; from here on, scoping extensions are optional fields on
+   `GraphSelection`, never new method parameters.

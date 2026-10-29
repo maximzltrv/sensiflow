@@ -15,7 +15,13 @@ from typing import Any
 import httpx
 import pytest
 
-from sensiflow import SensiflowConnectionError, SensiflowDependencyError, trace
+from sensiflow import (
+    GraphSelection,
+    SensiflowConnectionError,
+    SensiflowDependencyError,
+    SensiflowInputError,
+    trace,
+)
 from sensiflow.report import render_text
 from sensiflow.sources.openmetadata import OpenMetadataSource, _require_httpx
 
@@ -105,7 +111,7 @@ def test_owners_and_sql_are_mapped() -> None:
 
 
 def test_root_walk_collects_ancestors_and_descendants() -> None:
-    graph = make_source().build_graph([f"{PREFIX}.mart_customer_dump"])
+    graph = make_source().build_graph(GraphSelection(roots=(f"{PREFIX}.mart_customer_dump",)))
     assert set(graph.nodes) == {
         f"{PREFIX}.mart_customer_dump",
         f"{PREFIX}.dim_customers",
@@ -116,14 +122,16 @@ def test_root_walk_collects_ancestors_and_descendants() -> None:
 
 
 def test_root_downstream_walk_excludes_unrelated_sources() -> None:
-    graph = make_source().build_graph([f"{PREFIX}.raw_customers"])
+    graph = make_source().build_graph(GraphSelection(roots=(f"{PREFIX}.raw_customers",)))
     assert f"{PREFIX}.mart_daily_revenue" in graph.nodes
     assert f"{PREFIX}.raw_orders" not in graph.nodes  # cousin, not a descendant
 
 
 def test_multiple_roots_union_and_dedupe() -> None:
     graph = make_source().build_graph(
-        [f"{PREFIX}.mart_customer_dump", f"{PREFIX}.mart_daily_revenue"]
+        GraphSelection(
+            roots=(f"{PREFIX}.mart_customer_dump", f"{PREFIX}.mart_daily_revenue")
+        )
     )
     # Shared ancestors appear once; both closures are present.
     assert f"{PREFIX}.raw_customers" in graph.nodes
@@ -136,7 +144,7 @@ def test_multiple_roots_union_and_dedupe() -> None:
 
 def test_upstream_truncation_without_seeds_warns_hard() -> None:
     graph = make_source().build_graph(
-        [f"{PREFIX}.mart_customer_dump"], upstream_depth=1
+        GraphSelection(roots=(f"{PREFIX}.mart_customer_dump",), upstream_depth=1)
     )
     assert set(graph.nodes) == {
         f"{PREFIX}.mart_customer_dump",
@@ -151,7 +159,9 @@ def test_upstream_truncation_without_seeds_warns_hard() -> None:
 
 
 def test_downstream_zero_disables_direction_with_mild_note() -> None:
-    graph = make_source().build_graph([f"{PREFIX}.raw_customers"], downstream_depth=0)
+    graph = make_source().build_graph(
+        GraphSelection(roots=(f"{PREFIX}.raw_customers",), downstream_depth=0)
+    )
     assert set(graph.nodes) == {f"{PREFIX}.raw_customers"}
     assert any("downstream truncated" in w for w in graph.warnings)
     assert not any("upstream truncated" in w for w in graph.warnings)  # seeds present
@@ -159,10 +169,123 @@ def test_downstream_zero_disables_direction_with_mild_note() -> None:
 
 def test_deep_enough_limit_produces_no_warnings() -> None:
     graph = make_source().build_graph(
-        [f"{PREFIX}.mart_customer_dump"], upstream_depth=3, downstream_depth=5
+        GraphSelection(
+            roots=(f"{PREFIX}.mart_customer_dump",),
+            upstream_depth=3,
+            downstream_depth=5,
+        )
     )
     assert graph.warnings == []
     assert f"{PREFIX}.raw_customers" in graph.nodes
+
+
+# --- root selectors (ADR-0002 amendment: one listing pass, then the walk) -------
+
+
+def recording_source() -> tuple[OpenMetadataSource, list[httpx.Request]]:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return _handler(request)
+
+    return make_source(handler), requests
+
+
+def test_exact_roots_keep_the_listing_free_path() -> None:
+    source, requests = recording_source()
+    source.build_graph(GraphSelection(roots=(f"{PREFIX}.mart_customer_dump",)))
+    assert all(r.url.path != "/api/v1/tables" for r in requests)
+
+
+def test_pattern_resolves_via_one_light_listing_pass() -> None:
+    source, requests = recording_source()
+    graph = source.build_graph(GraphSelection(patterns=("mart_customer_*",)))
+    assert set(graph.nodes) == {
+        f"{PREFIX}.mart_customer_dump",
+        f"{PREFIX}.dim_customers",
+        f"{PREFIX}.stg_customers",
+        f"{PREFIX}.raw_customers",
+    }
+    listing = [r for r in requests if r.url.path == "/api/v1/tables"]
+    assert len(listing) == 3  # PAGE_SIZE=3 over 7 tables -> exactly one pass
+    assert all("fields" not in r.url.params for r in listing)  # names only
+
+
+def test_pattern_matches_fqns_too() -> None:
+    graph = make_source().build_graph(GraphSelection(patterns=(f"{PREFIX}.raw_*",)))
+    assert len(graph.nodes) == 7  # both raw tables plus their joint closure
+
+
+def test_pattern_matching_nothing_is_hard_error() -> None:
+    with pytest.raises(SensiflowInputError, match="'nothing_\\*' matched no tables"):
+        make_source().build_graph(GraphSelection(patterns=("nothing_*",)))
+
+
+def test_from_seeds_lists_with_column_tags_then_walks() -> None:
+    source, requests = recording_source()
+    graph = source.build_graph(GraphSelection(from_seeds=True))
+    # Only raw_customers is PII-tagged; its closure excludes the cousin source.
+    assert set(graph.nodes) == {
+        f"{PREFIX}.raw_customers",
+        f"{PREFIX}.stg_customers",
+        f"{PREFIX}.dim_customers",
+        f"{PREFIX}.mart_orders_enriched",
+        f"{PREFIX}.mart_customer_dump",
+        f"{PREFIX}.mart_daily_revenue",
+    }
+    listing = [r for r in requests if r.url.path == "/api/v1/tables"]
+    assert listing and all(
+        r.url.params["fields"] == "columns,tags" for r in listing
+    )  # markup must be visible on the listing pass
+
+
+def test_from_seeds_depths_flow_into_the_walk() -> None:
+    graph = make_source().build_graph(
+        GraphSelection(from_seeds=True, downstream_depth=1)
+    )
+    assert set(graph.nodes) == {f"{PREFIX}.raw_customers", f"{PREFIX}.stg_customers"}
+    assert any("downstream truncated" in w for w in graph.warnings)
+
+
+def test_from_seeds_without_any_pii_tags_is_input_error() -> None:
+    untagged = json.loads(json.dumps(TABLES))  # deep copy of the fixture
+    for table in untagged:
+        for column in table["columns"]:
+            column["tags"] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        start = int(request.url.params.get("after") or 0)
+        page = untagged[start : start + PAGE_SIZE]
+        paging: dict[str, str] = {}
+        if start + PAGE_SIZE < len(untagged):
+            paging["after"] = str(start + PAGE_SIZE)
+        return httpx.Response(200, json={"data": page, "paging": paging})
+
+    with pytest.raises(SensiflowInputError, match="no PII-tagged"):
+        make_source(handler).build_graph(GraphSelection(from_seeds=True))
+
+
+def test_listing_skips_malformed_entries() -> None:
+    # The /tables payload is untrusted: a non-dict item, a missing FQN, and an
+    # empty FQN must be skipped, never crash the listing (security finding).
+    junk: list[Any] = ["not-a-dict", {"name": "no_fqn_here"}, {"fullyQualifiedName": ""}]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/tables":
+            return httpx.Response(200, json={"data": junk + TABLES, "paging": {}})
+        return _handler(request)
+
+    source = make_source(handler)
+    graph = source.build_graph(GraphSelection(patterns=("mart_customer_*",)))
+    assert set(graph.nodes) == {
+        f"{PREFIX}.mart_customer_dump",
+        f"{PREFIX}.dim_customers",
+        f"{PREFIX}.stg_customers",
+        f"{PREFIX}.raw_customers",
+    }
+    # The full scan shares _list_tables and must survive the same payload.
+    assert len(source.build_graph().nodes) == 7
 
 
 # --- end to end through the engine ---------------------------------------------
@@ -194,7 +317,7 @@ def test_401_maps_to_connection_error_without_token() -> None:
 
 def test_unknown_root_maps_to_connection_error() -> None:
     with pytest.raises(SensiflowConnectionError, match="404"):
-        make_source().build_graph([f"{PREFIX}.no_such_table"])
+        make_source().build_graph(GraphSelection(roots=(f"{PREFIX}.no_such_table",)))
 
 
 def test_network_failure_message_has_no_request_details() -> None:
