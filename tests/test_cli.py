@@ -7,6 +7,7 @@ through the same entry point the `sensiflow` console script uses.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -68,13 +69,45 @@ def test_openmetadata_requires_credentials(
 
 
 def test_negative_depth_is_rejected(capsys: pytest.CaptureFixture[str]) -> None:
-    with pytest.raises(SystemExit) as excinfo:
-        main(["report", "--upstream-depth", "-1"])
-    assert excinfo.value.code == 2
-    assert "upstream-depth" in capsys.readouterr().err
+    # Depth validation lives in GraphSelection (ADR-0002 amendment A4), so it
+    # surfaces through the library error path (exit 1), not argparse (exit 2).
+    exit_code = main(["report", "--root", "raw_customers", "--upstream-depth", "-1"])
+    err = capsys.readouterr().err
+    assert exit_code == 1
+    assert err.startswith("error:")
+    assert "upstream-depth" in err
 
 
 def test_missing_command_is_rejected(capsys: pytest.CaptureFixture[str]) -> None:
     with pytest.raises(SystemExit) as excinfo:
         main([])
     assert excinfo.value.code == 2
+
+
+def test_roots_from_seeds_is_exclusive_with_root(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    exit_code = main(["report", "--root", "raw_customers", "--roots-from-seeds"])
+    err = capsys.readouterr().err
+    assert exit_code == 1
+    assert err.startswith("error:")
+    assert "mutually exclusive" in err
+
+
+def test_roots_file_may_be_given_at_most_once(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    roots_file = tmp_path / "roots.yaml"
+    roots_file.write_text("version: 1\nroots:\n  - id: raw_customers\n")
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            [
+                "report",
+                "--roots-file",
+                str(roots_file),
+                "--roots-file",
+                str(roots_file),
+            ]
+        )
+    assert excinfo.value.code == 2
+    assert "at most once" in capsys.readouterr().err

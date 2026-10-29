@@ -13,13 +13,13 @@ column tags ``pii`` / ``pii:<category>`` (secondary).
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
 from sensiflow.exceptions import SensiflowInputError
 from sensiflow.graph_scope import scope_graph
 from sensiflow.model import LineageGraph, Node, PiiTag
+from sensiflow.root_selectors import GraphSelection, resolve_patterns
 
 #: resource kinds that become graph vertices; tests/macros/exposures are not data.
 _INCLUDED_KINDS = frozenset({"model", "seed", "snapshot"})
@@ -94,24 +94,38 @@ class DbtSource:
     def __repr__(self) -> str:
         return f"DbtSource(manifest_path={str(self._path)!r})"
 
-    def build_graph(
-        self,
-        roots: Sequence[str] | None = None,
-        *,
-        upstream_depth: int | None = None,
-        downstream_depth: int | None = None,
-    ) -> LineageGraph:
+    def build_graph(self, selection: GraphSelection | None = None) -> LineageGraph:
         manifest = self._load()
         graph = self._graph_from_manifest(manifest)
-        if not roots:
+        if selection is None or selection.is_full_scan():
             return graph
-        resolved = [self._resolve_root(root, graph) for root in roots]
         return scope_graph(
             graph,
-            resolved,
-            upstream_depth=upstream_depth,
-            downstream_depth=downstream_depth,
+            self._resolve_selection(selection, graph),
+            upstream_depth=selection.upstream_depth,
+            downstream_depth=selection.downstream_depth,
         )
+
+    @staticmethod
+    def _resolve_selection(selection: GraphSelection, graph: LineageGraph) -> list[str]:
+        """Resolve the selection to node ids, in memory (ADR-0002 amendment A5)."""
+        if selection.from_seeds:
+            seeded = sorted(
+                node_id for node_id, node in graph.nodes.items() if node.declared_pii
+            )
+            if not seeded:
+                raise SensiflowInputError(
+                    "--roots-from-seeds found no PII-seeded models or sources in the "
+                    "manifest; sensiflow needs declared PII markup to trace from "
+                    "(ADR-0001 applicability precondition)"
+                )
+            return seeded
+        resolved = [DbtSource._resolve_root(root, graph) for root in selection.roots]
+        if selection.patterns:
+            candidates = [(node_id, node.name) for node_id, node in graph.nodes.items()]
+            resolved.extend(resolve_patterns(selection.patterns, candidates))
+        # One node matched by several selectors appears once (A2).
+        return list(dict.fromkeys(resolved))
 
     def _load(self) -> dict[str, Any]:
         try:

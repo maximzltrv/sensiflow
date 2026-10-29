@@ -16,12 +16,14 @@ from sensiflow.model import (
     Risk,
     TraceResult,
 )
+from sensiflow.root_selectors import GraphSelection
 
 __version__ = "0.1.0"
 
 __all__ = [
     "DEFAULT_GENERIC_COLUMNS",
     "Finding",
+    "GraphSelection",
     "LineageGraph",
     "Node",
     "NodeResult",

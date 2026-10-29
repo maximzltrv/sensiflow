@@ -10,6 +10,7 @@ import sys
 from sensiflow.engine import trace
 from sensiflow.exceptions import SensiflowError
 from sensiflow.report import render_json, render_text
+from sensiflow.root_selectors import GraphSelection, has_glob_chars, load_roots_file
 from sensiflow.sources.base import LineageSource
 from sensiflow.sources.mock import MockSource
 
@@ -56,8 +57,30 @@ def _build_parser() -> argparse.ArgumentParser:
         "--root",
         action="append",
         dest="roots",
-        metavar="FQN",
-        help="table FQN to walk lineage from; repeatable; omit for a full catalog scan",
+        metavar="ID_OR_GLOB",
+        help=(
+            "node to walk lineage from: an exact id/FQN, or an fnmatch glob "
+            "(*, ?, [) matched against node ids and bare names; repeatable; "
+            "omit for a full catalog scan"
+        ),
+    )
+    report.add_argument(
+        "--roots-file",
+        action="append",
+        dest="roots_files",
+        metavar="PATH",
+        help=(
+            "YAML roots file (version 1 schema; id/pattern entries); at most "
+            "one occurrence; combines with --root as a union"
+        ),
+    )
+    report.add_argument(
+        "--roots-from-seeds",
+        action="store_true",
+        help=(
+            "use every PII-seeded node as a root; mutually exclusive with "
+            "--root and --roots-file"
+        ),
     )
     report.add_argument(
         "--upstream-depth",
@@ -94,23 +117,37 @@ def _make_source(parser: argparse.ArgumentParser, args: argparse.Namespace) -> L
     return MockSource()
 
 
+def _build_selection(args: argparse.Namespace) -> GraphSelection:
+    """Fold the selector flags into one GraphSelection (validation lives there)."""
+    roots: list[str] = []
+    patterns: list[str] = []
+    if args.roots_files:
+        file_selection = load_roots_file(args.roots_files[0])
+        roots.extend(file_selection.roots)
+        patterns.extend(file_selection.patterns)
+    for value in args.roots or []:
+        (patterns if has_glob_chars(value) else roots).append(value)
+    return GraphSelection(
+        roots=tuple(roots),
+        patterns=tuple(patterns),
+        from_seeds=args.roots_from_seeds,
+        upstream_depth=args.upstream_depth,
+        downstream_depth=args.downstream_depth,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
 
     if args.command == "report":
-        for name in ("upstream_depth", "downstream_depth"):
-            value = getattr(args, name)
-            if value is not None and value < 0:
-                parser.error(f"--{name.replace('_', '-')} must be >= 0")
+        if args.roots_files and len(args.roots_files) > 1:
+            # argparse would silently keep the last occurrence; reject instead.
+            parser.error("--roots-file may be given at most once")
 
         source = _make_source(parser, args)
         try:
-            graph = source.build_graph(
-                args.roots,
-                upstream_depth=args.upstream_depth,
-                downstream_depth=args.downstream_depth,
-            )
+            graph = source.build_graph(_build_selection(args))
         except SensiflowError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
