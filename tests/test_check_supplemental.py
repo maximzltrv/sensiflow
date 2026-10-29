@@ -10,16 +10,14 @@ Grey-box probes of what the spec promises beyond the developer's own tests:
 - output purity and shape for `--format json` (empty graph, warnings);
 - boundary policy values (0.0, 1.0, NaN/inf) and ORIGIN at `--fail-on LOW`.
 
-Tests marked ``xfail(strict=True)`` encode defects found in this QA pass: they
-document the correct behavior and will turn red (XPASS) once fixed, so the
-marker must then be removed. Synthetic names only.
+Defects found in this QA pass are fixed (ADR-0004 A1-A4); their tests are
+plain regression tests now. Synthetic names only.
 """
 
 from __future__ import annotations
 
 import io
 import json
-import math
 import os
 import subprocess
 import sys
@@ -124,11 +122,6 @@ class _BrokenPipeStdout(io.StringIO):
 # --- DEFECT: stdout failures escape the wrapper (exit 1 on a PASS path) ----------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="QA defect: print() runs outside _run_check's wrapper; a stdout encoding "
-    "error on a PASS run escapes main() and the process exits 1 (ADR-0004 §1)",
-)
 def test_check_pass_with_unencodable_stdout_never_exits_1(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -140,22 +133,12 @@ def test_check_pass_with_unencodable_stdout_never_exits_1(
     assert exit_code in (ExitCode.OK, ExitCode.OPERATIONAL_ERROR)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="QA defect: BrokenPipeError from print() escapes main(); a PASS run piped "
-    "into `head` exits 1 (indistinguishable from a gate trip, ADR-0004 §1)",
-)
 def test_check_pass_with_broken_pipe_never_exits_1(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sys, "stdout", _BrokenPipeStdout())
     exit_code = main(["check", "--fail-on", "HIGH", "--min-confidence", "0.9"])
     assert exit_code in (ExitCode.OK, ExitCode.OPERATIONAL_ERROR)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="QA defect: the real process exits 1 on a PASS run when stdout cannot "
-    "encode the text output (e.g. a latin-1/ascii CI locale)",
-)
 def test_check_pass_process_exit_code_with_ascii_stdout() -> None:
     env = {**os.environ, "PYTHONIOENCODING": "ascii"}
     proc = subprocess.run(
@@ -172,11 +155,6 @@ def test_check_pass_process_exit_code_with_ascii_stdout() -> None:
 # --- DEFECT: `report` can still exit 1 on an internal error -----------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="QA defect: report has no broad-Exception wrapper; ADR-0004 §1 table maps "
-    "an unexpected internal error to 3 for ANY command and says report never exits 1",
-)
 def test_report_unexpected_crash_exits_3(
     capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -189,11 +167,6 @@ def test_report_unexpected_crash_exits_3(
     assert "synthetic internal failure" in capsys.readouterr().err
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="QA defect: a cyclic lineage graph (engine ValueError) makes report exit 1 "
-    "with a traceback; check maps the same input to 3",
-)
 def test_report_cyclic_graph_never_exits_1(tmp_path: Path) -> None:
     manifest = _write_manifest(
         tmp_path,
@@ -207,14 +180,13 @@ def test_report_cyclic_graph_never_exits_1(tmp_path: Path) -> None:
         },
     )
     exit_code = main(["report", "--source", "dbt", "--dbt-manifest", manifest])
-    assert exit_code != 1
-    assert exit_code == ExitCode.OPERATIONAL_ERROR
+    assert exit_code == ExitCode.INPUT_ERROR
 
 
-def test_check_cyclic_graph_exits_3_not_1(
+def test_check_cyclic_graph_is_input_error_without_traceback(
     capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
-    # Same realistic crash input as above; check's wrapper handles it correctly.
+    # A cycle is an input error (ADR-0004 A3): one-line message, no traceback.
     manifest = _write_manifest(
         tmp_path,
         {
@@ -228,20 +200,15 @@ def test_check_cyclic_graph_exits_3_not_1(
     )
     exit_code = main(["check", "--source", "dbt", "--dbt-manifest", manifest, "--fail-on", "LOW"])
     captured = capsys.readouterr()
-    assert exit_code == ExitCode.OPERATIONAL_ERROR
-    assert "Traceback (most recent call last)" in captured.err
+    assert exit_code == ExitCode.INPUT_ERROR
+    assert "error: lineage graph contains a cycle" in captured.err
+    assert "Traceback" not in captured.err
     assert captured.out == ""
 
 
 # --- DEFECT: inclusive confidence boundary vs published confidence ----------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="QA defect: engine confidence 0.8*0.7 = 0.5599999999999999 is published as "
-    "0.56 (JSON and text), yet --min-confidence 0.56 suppresses it — the inclusive "
-    "boundary does not hold for the values the tool itself shows",
-)
 def test_min_confidence_equal_to_published_confidence_gates(
     capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
@@ -341,9 +308,10 @@ def test_text_violation_block_omits_its_own_suppressed_finding() -> None:
 # --- boundary policy values ------------------------------------------------------
 
 
-def test_float_boundary_exact_vs_next_below() -> None:
+def test_float_boundary_exact_vs_next_published_step_below() -> None:
+    # A4: the comparison is at 4 dp, so the next distinguishable value is 0.7499.
     exact = _result(_node("n", _finding("email", "HIGH", 0.75)))
-    below = _result(_node("n", _finding("email", "HIGH", math.nextafter(0.75, 0.0))))
+    below = _result(_node("n", _finding("email", "HIGH", 0.7499)))
     assert evaluate_gate(exact, fail_on="HIGH", min_confidence=0.75).tripped
     outcome = evaluate_gate(below, fail_on="HIGH", min_confidence=0.75)
     assert not outcome.tripped
@@ -353,7 +321,7 @@ def test_float_boundary_exact_vs_next_below() -> None:
 def test_min_confidence_one_gates_only_full_confidence_findings() -> None:
     result = _result(
         _node("certain", _finding("email", "HIGH", 1.0)),
-        _node("almost", _finding("email", "HIGH", 0.999999)),
+        _node("almost", _finding("email", "HIGH", 0.9999)),
     )
     outcome = evaluate_gate(result, fail_on="HIGH", min_confidence=1.0)
     assert [n.node_id for n in outcome.violations] == ["certain"]

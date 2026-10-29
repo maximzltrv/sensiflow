@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import traceback
+from collections.abc import Callable
 from enum import IntEnum
 
 from sensiflow.engine import trace
@@ -212,29 +213,30 @@ def _error_exit_code(exc: SensiflowError) -> ExitCode:
     return ExitCode.OPERATIONAL_ERROR
 
 
-def _run_report(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
+def _silence_stdout() -> None:
+    """Point fd 1 at devnull so interpreter shutdown cannot hit EPIPE again."""
     try:
-        result = _run_trace(parser, args)
-    except SensiflowError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return _error_exit_code(exc)
-    if args.format == "json":
-        print(json.dumps(render_json(result), indent=2))
-    else:
-        print(render_text(result), end="")
-    return ExitCode.OK
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+    except (OSError, ValueError):
+        pass  # no real fd behind sys.stdout (e.g. captured in tests)
 
 
-def _run_check(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
+def _guarded(compute: Callable[[], tuple[str, ExitCode]]) -> int:
+    """Run a command inside the CLI-wide error wrapper (ADR-0004 A1/A2).
+
+    ``compute`` returns the rendered document and the verdict code. Emitting the
+    document is part of the protected region: no failure path may exit 1.
+    """
+    verdict: ExitCode | None = None
     try:
-        result = _run_trace(parser, args)
-        outcome = evaluate_gate(
-            result, fail_on=args.fail_on, min_confidence=args.min_confidence
-        )
-        if args.format == "json":
-            output = json.dumps(render_check_json(result, outcome), indent=2) + "\n"
-        else:
-            output = render_check_text(result, outcome)
+        output, verdict = compute()
+        print(output, end="")
+        sys.stdout.flush()
+    except BrokenPipeError:
+        # The reader went away; nothing failed, so the computed verdict stands.
+        _silence_stdout()
+        return verdict if verdict is not None else ExitCode.OPERATIONAL_ERROR
     except SensiflowError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return _error_exit_code(exc)
@@ -243,8 +245,30 @@ def _run_check(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
         # must never fake one. Full traceback on stderr, honest exit code.
         traceback.print_exc(file=sys.stderr)
         return ExitCode.OPERATIONAL_ERROR
-    print(output, end="")
-    return ExitCode.GATE_TRIPPED if outcome.tripped else ExitCode.OK
+    return verdict
+
+
+def _run_report(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
+    def compute() -> tuple[str, ExitCode]:
+        result = _run_trace(parser, args)
+        if args.format == "json":
+            return json.dumps(render_json(result), indent=2) + "\n", ExitCode.OK
+        return render_text(result), ExitCode.OK
+
+    return _guarded(compute)
+
+
+def _run_check(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
+    def compute() -> tuple[str, ExitCode]:
+        result = _run_trace(parser, args)
+        outcome = evaluate_gate(result, fail_on=args.fail_on, min_confidence=args.min_confidence)
+        if args.format == "json":
+            output = json.dumps(render_check_json(result, outcome), indent=2) + "\n"
+        else:
+            output = render_check_text(result, outcome)
+        return output, ExitCode.GATE_TRIPPED if outcome.tripped else ExitCode.OK
+
+    return _guarded(compute)
 
 
 def main(argv: list[str] | None = None) -> int:
