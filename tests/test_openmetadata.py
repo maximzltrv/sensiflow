@@ -81,6 +81,19 @@ def make_source(handler: Any = _handler) -> OpenMetadataSource:
     )
 
 
+def test_host_with_embedded_credentials_is_rejected_without_echo() -> None:
+    with pytest.raises(SensiflowInputError) as excinfo:
+        OpenMetadataSource("http://svc_user:s3cret_pw@omd.test:8585", TOKEN)
+    message = str(excinfo.value)
+    assert "OMD_TOKEN" in message
+    assert "svc_user" not in message
+    assert "s3cret_pw" not in message
+
+
+def test_host_without_userinfo_is_accepted() -> None:
+    assert OpenMetadataSource("http://omd.test:8585/", TOKEN).host == "http://omd.test:8585"
+
+
 # --- full scan ---------------------------------------------------------------
 
 

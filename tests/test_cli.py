@@ -138,3 +138,19 @@ def test_roots_file_may_be_given_at_most_once(
         )
     assert excinfo.value.code == 2
     assert "at most once" in capsys.readouterr().err
+
+
+def test_cli_rejects_host_with_embedded_credentials(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("OMD_TOKEN", raising=False)
+    code = main(
+        ["report", "--source", "openmetadata", "--omd-token", "tok_synthetic",
+         "--omd-host", "http://svc_user:s3cret_pw@omd.test"]
+    )
+    captured = capsys.readouterr()
+    assert code == 2
+    assert "error: credentials embedded" in captured.err
+    assert "svc_user" not in captured.err
+    assert "s3cret_pw" not in captured.err
+    assert captured.out == ""
