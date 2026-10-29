@@ -318,7 +318,10 @@ file and the exact problem:
 
 The last two rules keep the file lossless: after loading, entries collapse to
 the same selector strings the CLI `--root` channel produces, with no
-ambiguity about which entry was meant as exact and which as a pattern. There
+ambiguity about which entry was meant as exact and which as a pattern. Both
+kinds fail hard when they resolve to nothing (A6), so the distinction does
+not change failure behavior — its value is message precision ("unknown root
+id 'X'" vs "root pattern 'X' matched no tables"). There
 is deliberately no second way to express anything — no free-form sections, no
 per-entry options. Future needs (per-root depths, comments beyond YAML `#`)
 require a `version: 2` and a new review, not schema creep.
@@ -333,9 +336,10 @@ the engine — owns:
   returning plain selector strings;
 - classification of a selector string as exact vs pattern (the
   metacharacter test, defined in exactly one place);
-- `resolve_patterns(selectors, candidates) -> (ids, warnings)`: fnmatch
-  resolution of pattern selectors against an iterable of `(id, name)`
-  candidate pairs, producing matched node ids plus zero-match warnings (A6).
+- `resolve_patterns(selectors, candidates) -> list[str]`: fnmatch resolution
+  of pattern selectors against an iterable of `(id, name)` candidate pairs,
+  producing matched node ids; a pattern that matches nothing raises
+  `SensiflowInputError` (A6).
 
 Connectors stay thin: they supply candidates and keep their exact-root
 semantics; the matching rules live in one module, so dbt and OMD cannot
@@ -385,14 +389,19 @@ as it already does for the others (fixed graph).
 
 - **Unknown exact root:** error, unchanged (dbt: `SensiflowInputError` with
   the candidate list when ambiguous; OMD: the existing 404 handling).
-- **A pattern matching zero nodes** while the overall root set is non-empty:
-  a **warning** in `LineageGraph.warnings` ("root pattern 'X' matched no
-  tables"), not an error — multi-pattern files legitimately contain patterns
-  that are empty in some environments. The warning keeps typos visible.
-- **Resolution yields an empty root set** (all patterns empty, no exact
-  roots): `SensiflowInputError` ("no tables matched the given root
-  selectors"). Explicitly **no fallback to full scan** — silently converting
-  a typo into the most expensive possible run would be hostile.
+- **A pattern matching zero nodes:** a hard `SensiflowInputError` ("root
+  pattern 'X' matched no tables"), even when other selectors did match.
+  Decided strict during review (2026-10-29): a softer warning mode was
+  considered and rejected — a silently empty pattern would be dangerous
+  under the planned `check` CI gate (a typo could greenlight a pipeline),
+  and relaxing an error into a warning later is a cheap, compatible change,
+  whereas tightening a warning into an error breaks existing users. No
+  leniency debt is taken on without a demonstrated benefit.
+- Because every selector must resolve (exact roots must exist, patterns must
+  match at least one node), an empty resolved root set cannot occur; in
+  particular there is **no fallback to full scan** — silently converting a
+  typo into the most expensive possible run would be hostile (see
+  alternative 7).
 - **`--roots-from-seeds` finds zero seeds:** `SensiflowInputError` stating
   that no PII-seeded tables exist and pointing at the applicability
   precondition of ADR-0001. This is a hard error, not the ADR-0001 "no seeds
@@ -408,15 +417,25 @@ roots** — selectors change only how the root set is produced, never what
 walking from it means. ADR-0003 §5's in-memory implementation is unaffected
 for the same reason.
 
-#### A8. Dependency: PyYAML enters the core install
+#### A8. Dependency: PyYAML behind an optional extra, lazily imported
 
 The roots file needs a YAML parser; the standard library has none. PyYAML
-(`pyyaml>=6`) is added as a **core** dependency: it is the de-facto standard
-(no transitive dependencies, ubiquitous, maintained), loading uses
-`yaml.safe_load` only, and `types-PyYAML` joins the dev group for strict
-mypy. This changes the "base install has a single dependency" consequence
-recorded in this ADR and ADR-0003 to "two (`sqlglot`, `pyyaml`)" — flagged
-for explicit acceptance in review.
+(`pyyaml>=6`) is added as an **optional extra**, mirroring the `httpx`
+pattern of §1–§2 of this ADR:
+
+```toml
+[project.optional-dependencies]
+yaml = ["pyyaml>=6"]
+```
+
+The import happens lazily inside the roots-file loader; if PyYAML is not
+installed, `--roots-file` raises `SensiflowDependencyError` naming the exact
+fix: `pip install 'sensiflow[yaml]'`. The base dependency set stays
+unchanged (`sqlglot` only) — the "single-dependency base install"
+consequence recorded in this ADR and ADR-0003 continues to hold. Loading
+uses `yaml.safe_load` only; `types-PyYAML` joins the dev group for strict
+mypy. Glob patterns and `--roots-from-seeds` need no extra — only the file
+form pays the install step.
 
 #### A9. CLI surface after this amendment (supersedes §7's listing)
 
@@ -465,9 +484,13 @@ Positive:
 
 Negative / accepted trade-offs:
 
-- Second core dependency (PyYAML) — see A8.
+- `--roots-file` requires an extra install step (`sensiflow[yaml]`); the
+  dependency-missing error names the fix (A8).
 - Patterns and from-seeds on OMD cost a full table-listing pass; documented,
   and still cheaper than the full scan.
+- Strict zero-match semantics (A6) mean multi-environment roots files must
+  only contain patterns that match everywhere they are used; a leniency
+  mode, if ever justified, is a compatible relaxation.
 - fnmatch is case-sensitive and not segment-aware; both are documented
   behaviors rather than options (no new knobs in v1).
 - Exact bare-name roots remain dbt-only (A5 asymmetry).
@@ -494,12 +517,13 @@ Negative / accepted trade-offs:
    unacceptable for a checked-in, reviewed config. TOML (stdlib `tomllib`)
    would avoid the PyYAML dependency but is an unusual choice for list-heavy
    data-engineering config, where YAML is the established convention (dbt,
-   catalog ingestion). Rejected in favor of YAML plus the A8 dependency.
-5. **Lazy-optional PyYAML** (import on first `--roots-file`, else
-   `SensiflowDependencyError` naming the fix). Keeps the base at one
-   dependency, but fragments the UX of a core CLI feature over a tiny,
-   universally available package. Rejected; recorded as the fallback if
-   review refuses the core dependency.
+   catalog ingestion). Rejected in favor of YAML plus the A8 extra.
+5. **PyYAML as a core dependency.** Simpler UX (no extra to install for
+   `--roots-file`) for a tiny, ubiquitous package — but it breaks the
+   single-dependency base install recorded in two accepted ADRs for an
+   opt-in convenience feature, and the connector-extra precedent (§1–§2)
+   already gives users a well-understood install-hint pattern. Rejected in
+   review (2026-10-29) in favor of the lazy-optional extra (A8).
 6. **A `seeds:` magic selector string instead of the `roots_from_seeds`
    flag.** Rejected: it squats in the id namespace and hides a mode switch
    inside data.
@@ -507,14 +531,18 @@ Negative / accepted trade-offs:
    converts a typo into the most expensive run the connector can make and
    masks the error.
 
+### Review notes (2026-10-29)
+
+Resolved during review:
+
+1. PyYAML ships as a lazy-optional extra, not a core dependency (A8,
+   alternative 5).
+2. Zero-match patterns fail hard from v1 (A6); the warning mode was
+   rejected.
+3. Case-sensitive matching only in v1 — confirmed.
+4. `--roots-file` accepted at most once per invocation — confirmed.
+
 ### Open questions for review
 
-1. PyYAML in core (A8) vs the lazy-optional fallback (alternative 5) — this
-   amends the single-dependency consequence of two accepted ADRs.
-2. Zero-match pattern as a warning (A6): acceptable, or should a stricter
-   mode (any empty pattern fails) exist for CI before `check` lands?
-3. Case-sensitive matching only: confirm no case-folding option is wanted
-   in v1.
-4. `--roots-file` single-occurrence restriction: acceptable for v1?
-5. Confirmation that this is the last compatible `build_graph` signature
+1. Confirmation that this is the last compatible `build_graph` signature
    change before the protocol is considered stable.
