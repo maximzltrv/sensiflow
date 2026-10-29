@@ -308,7 +308,7 @@ file and the exact problem:
 | Rule | Message gist |
 |------|--------------|
 | File must exist and be readable | `roots file not found: PATH` |
-| Must parse as YAML (`yaml.safe_load`) | `roots file PATH: invalid YAML: <parser error>` |
+| Must parse as YAML (`yaml.safe_load`) | `roots file PATH: invalid YAML: <problem (line, column)>` — see hardening addendum |
 | Top level must be a mapping with exactly the keys `version` and `roots` | unknown top-level key `X` rejected |
 | `version` must be the integer `1` | `unsupported roots-file version: X (supported: 1)` |
 | `roots` must be a non-empty list | `'roots' must be a non-empty list` |
@@ -326,6 +326,27 @@ precision ("unknown root id 'X'" vs "root pattern 'X' matched no tables"). There
 is deliberately no second way to express anything — no free-form sections, no
 per-entry options. Future needs (per-root depths, comments beyond YAML `#`)
 require a `version: 2` and a new review, not schema creep.
+
+**Hardening addendum (2026-10-29, from the implementation review rounds).**
+The shipped loader tightens the pinned schema in four ways, all strictly
+narrowing what is accepted:
+
+- the roots file must be valid UTF-8 (`UnicodeDecodeError` →
+  `SensiflowInputError` "not valid UTF-8");
+- files larger than 1 MiB are rejected before reading or parsing (an
+  alias-expansion/DoS guard — a legitimate roots file is orders of
+  magnitude smaller);
+- invalid-YAML messages are sanitized: built from the parser's problem text
+  plus line/column only, never the raw exception string, which can embed a
+  snippet of the file contents (dangerous when a non-YAML file — e.g. a
+  credentials file — is passed by mistake);
+- a heuristic guard test pins `yaml.safe_load` as the only YAML entry point
+  in the codebase (the lazy-import indirection of A8 defeats linter-based
+  detection, so the test greps the source).
+
+The same UTF-8 rule was applied to the dbt manifest loader (ADR-0003 §2's
+defensive parsing) for consistency; deliberately **no** size cap there —
+multi-megabyte manifests are legitimate dbt output.
 
 #### A4. Where resolution lives: a shared selector layer
 
