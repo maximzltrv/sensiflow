@@ -12,6 +12,9 @@ from pathlib import Path
 import pytest
 
 from sensiflow.cli import main
+from sensiflow.exceptions import SensiflowConnectionError
+from sensiflow.root_selectors import GraphSelection
+from sensiflow.sources.mock import MockSource
 
 
 def test_report_text_end_to_end(capsys: pytest.CaptureFixture[str]) -> None:
@@ -70,10 +73,11 @@ def test_openmetadata_requires_credentials(
 
 def test_negative_depth_is_rejected(capsys: pytest.CaptureFixture[str]) -> None:
     # Depth validation lives in GraphSelection (ADR-0002 amendment A4), so it
-    # surfaces through the library error path (exit 1), not argparse (exit 2).
+    # surfaces through the library error path; SensiflowInputError maps to
+    # exit 2 in the ADR-0004 taxonomy, matching argparse's native usage errors.
     exit_code = main(["report", "--root", "raw_customers", "--upstream-depth", "-1"])
     err = capsys.readouterr().err
-    assert exit_code == 1
+    assert exit_code == 2
     assert err.startswith("error:")
     assert "upstream-depth" in err
 
@@ -89,9 +93,32 @@ def test_roots_from_seeds_is_exclusive_with_root(
 ) -> None:
     exit_code = main(["report", "--root", "raw_customers", "--roots-from-seeds"])
     err = capsys.readouterr().err
-    assert exit_code == 1
+    assert exit_code == 2
     assert err.startswith("error:")
     assert "mutually exclusive" in err
+
+
+def test_report_invalid_manifest_is_input_error(capsys: pytest.CaptureFixture[str]) -> None:
+    # ADR-0004 realignment: report's input errors now exit 2, not 1.
+    exit_code = main(["report", "--source", "dbt", "--dbt-manifest", "no/such/manifest.json"])
+    err = capsys.readouterr().err
+    assert exit_code == 2
+    assert err.startswith("error:")
+
+
+def test_report_operational_error_exits_3(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # ADR-0004 realignment: environmental failures exit 3, distinguishable
+    # from input errors (2) so CI can decide whether a retry makes sense.
+    def boom(self: MockSource, selection: GraphSelection | None = None) -> None:
+        raise SensiflowConnectionError("catalog unreachable at http://localhost:8585")
+
+    monkeypatch.setattr(MockSource, "build_graph", boom)
+    exit_code = main(["report", "--source", "mock"])
+    err = capsys.readouterr().err
+    assert exit_code == 3
+    assert err.startswith("error:")
 
 
 def test_roots_file_may_be_given_at_most_once(
