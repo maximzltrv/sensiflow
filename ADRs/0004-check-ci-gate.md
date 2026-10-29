@@ -475,6 +475,11 @@ Decision: `evaluate_gate` performs the inclusive comparison at the published
 precision — both the finding's confidence and `min_confidence` are rounded
 to 4 decimal places (the JSON output precision) before the `>=` comparison.
 The range validation of `min_confidence` still applies to the raw value.
+Corollary (deliberate, in the safe direction): a finding whose raw
+confidence rounds up to the threshold also gates — e.g. confidence 0.99996
+gates at `--min-confidence 1.0`, exactly as its published value (1.0)
+promises; the rounding can only add gating findings, never suppress one
+whose published value meets the threshold.
 
 Alternatives considered:
 
