@@ -154,3 +154,20 @@ def test_cli_rejects_host_with_embedded_credentials(
     assert "svc_user" not in captured.err
     assert "s3cret_pw" not in captured.err
     assert captured.out == ""
+
+
+def test_cli_rejects_schemeless_host_with_credentials(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("OMD_TOKEN", raising=False)
+    code = main(
+        ["report", "--source", "openmetadata", "--omd-token", "tok_synthetic",
+         "--omd-host", "svc_user:s3cret_pw@omd.test"]
+    )
+    captured = capsys.readouterr()
+    assert code == 2
+    assert "must start with http:// or https://" in captured.err
+    for stream in (captured.err, captured.out):
+        assert "s3cret_pw" not in stream
+        assert "svc_user" not in stream
+    assert captured.out == ""

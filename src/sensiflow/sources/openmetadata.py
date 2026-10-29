@@ -104,6 +104,12 @@ class OpenMetadataSource:
         timeout: float = 30.0,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
+        # Scheme first: a scheme-less "user:pw@host" parses with no netloc, so it
+        # must be rejected here, before any code path could interpolate the host.
+        if not host.lower().startswith(("http://", "https://")):
+            raise SensiflowInputError(
+                "the OpenMetadata host URL must start with http:// or https://"
+            )
         if _has_userinfo(host):
             # Never echo the userinfo: it would leak the embedded credentials.
             raise SensiflowInputError(
