@@ -1,6 +1,9 @@
 # ADR-0004: `check` command — a CI gate with a fixed exit-code contract
 
-- **Status:** Proposed
+- **Status:** Accepted (2026-10-29, after review; review decisions:
+  `--fail-on` required with no default; warnings do not affect the exit code
+  in v1; `--min-confidence` included in this slice with suppressed findings
+  surfaced, never hidden; `report` error exits aligned to the taxonomy)
 - **Date:** 2026-10-29
 - **Deciders:** Maksim Zolotarev
 
@@ -89,16 +92,30 @@ GateRisk = Literal["LOW", "MEDIUM", "HIGH"]
 @dataclass(frozen=True)
 class GateOutcome:
     fail_on: GateRisk
+    min_confidence: float                # 0.0 = every finding gates (default)
     tripped: bool
-    violations: tuple[NodeResult, ...]   # nodes at/above threshold, most exposed first
+    violations: tuple[NodeResult, ...]   # nodes with >=1 gating finding, most exposed first
+    suppressed: tuple[tuple[str, Finding], ...]
+    # (node_id, finding) pairs at/above fail_on risk but below min_confidence —
+    # excluded from gating, surfaced for audit; empty at the default threshold
 
-def evaluate_gate(result: TraceResult, *, fail_on: GateRisk) -> GateOutcome: ...
+def evaluate_gate(
+    result: TraceResult, *, fail_on: GateRisk, min_confidence: float = 0.0
+) -> GateOutcome: ...
 ```
 
-- `evaluate_gate` validates the threshold (`SensiflowInputError` for anything
-  outside `LOW`/`MEDIUM`/`HIGH`) and selects violating nodes via the existing
-  `TraceResult.by_risk` ordering (a node violates when its `max_risk` ranks
-  at or above the threshold).
+- `evaluate_gate` validates its policy inputs (`SensiflowInputError` for a
+  threshold outside `LOW`/`MEDIUM`/`HIGH` or a `min_confidence` outside
+  `[0.0, 1.0]`) and evaluates the gate **per finding**: a finding *gates*
+  when its risk ranks at or above `fail_on` **and** its confidence is `>=
+  min_confidence`. A node is a violation when it has at least one gating
+  finding; violations are ordered as `TraceResult.by_risk` orders nodes
+  (most exposed first, then by name). A finding at or above the risk
+  threshold whose confidence is below `min_confidence` is *suppressed*:
+  collected into `GateOutcome.suppressed` (same ordering: risk descending,
+  then node name, then column), never silently dropped. At the default
+  `min_confidence=0.0` nothing is ever suppressed and the gate reduces to
+  pure risk evaluation. See §5 for the policy rationale.
 - **`ORIGIN` and `NONE` are not valid thresholds and `ORIGIN` never trips the
   gate.** An `ORIGIN` node is the declared seed — the applicability
   precondition of ADR-0001, not an exposure. `NONE` as a threshold would trip
@@ -115,6 +132,7 @@ def evaluate_gate(result: TraceResult, *, fail_on: GateRisk) -> GateOutcome: ...
 
 ```
 sensiflow check --fail-on {LOW|MEDIUM|HIGH}
+                [--min-confidence X]
                 [--source mock|openmetadata|dbt] [--format text|json]
                 [--dialect D]
                 [--omd-host H --omd-token T] [--dbt-manifest PATH]
@@ -129,11 +147,18 @@ sensiflow check --fail-on {LOW|MEDIUM|HIGH}
   compatible relaxation, while removing or changing a default breaks existing
   pipelines silently. Threshold values are accepted case-insensitively and
   normalized to upper case.
+- **`--min-confidence X` is optional, default `0.0`** (float; valid range
+  `0.0`–`1.0`, validated in `evaluate_gate` so library callers get the same
+  check; an out-of-range value is a usage error, exit 2). At the default,
+  every finding gates — the flag is strictly opt-in, so the out-of-the-box
+  gate can never produce a confidence-induced false negative. Semantics and
+  output treatment are defined in §5.
 - **Shared flags are defined once** via an argparse parent parser
   (`add_help=False`) holding everything `report` and `check` have in common:
   `--source`, the connector options, `--dialect`, and the entire root-selector
   group (`--root`, `--roots-file`, `--roots-from-seeds`, depths). `check`
-  adds only `--fail-on` and its own `--format {text|json}`. The existing
+  adds only `--fail-on`, `--min-confidence`, and its own
+  `--format {text|json}`. The existing
   helpers `_make_source` and `_build_selection` are reused unchanged —
   `check` performs the same graph build and `trace()` call as `report`, then
   applies `evaluate_gate`.
@@ -177,10 +202,12 @@ goes to **stdout** in the chosen format; errors and diagnostics go to
   ```json
   {
     "fail_on": "HIGH",
+    "min_confidence": 0.0,
     "tripped": true,
     "summary": {"HIGH": 1, "MEDIUM": 2, "LOW": 1, "ORIGIN": 1, "NONE": 2},
     "warnings": [],
-    "violations": [ ...node objects, identical shape to report --format json... ]
+    "violations": [ ...node objects, identical shape to report --format json... ],
+    "suppressed": [ ...finding objects plus node identity, see §5; [] by default... ]
   }
   ```
 
@@ -189,18 +216,63 @@ goes to **stdout** in the chosen format; errors and diagnostics go to
   `check` JSON. The document's evolution rule is **additive-only**: new keys
   may appear; existing keys never change meaning or type.
 
-- **Warnings do not affect the exit code in v1.** They are printed in both
-  formats (and are structurally present in the JSON) so CI logs surface them,
-  but a warned run that finds nothing at threshold exits 0. See open
-  question 2 — the upstream-truncation warning is the one case where this
-  default is genuinely debatable.
+- **Warnings do not affect the exit code in v1** (confirmed at review). They
+  are printed in both formats (and are structurally present in the JSON) so
+  CI logs surface them, but a warned run that finds nothing at threshold
+  exits 0. The upstream-truncation warning is the known sharp edge of this
+  default — a truncated run can exit 0 on incomplete data; revisit on
+  evidence (a `--strict-warnings` flag is a compatible tightening if
+  introduced as opt-in).
 
-- **Confidence does not affect the gate in v1.** Every finding's confidence
-  is displayed in both formats, but a low-confidence HIGH finding trips the
-  gate like any other. A `--min-confidence` filter is a compatible future
-  addition (see open question 3); shipping without it keeps v1 conservative —
-  false positives in a gate are visible and annoying, false negatives are
-  invisible and dangerous.
+### 5. Confidence threshold: `--min-confidence` filters the gate, never the eyes
+
+Decided at review (2026-10-29) to ship in this slice rather than defer: the
+false-positive cost of a gate is paid on every red pipeline, so the control
+must exist from day one — but it is designed so that using it never hides
+information.
+
+- **Semantics.** A finding gates only when `risk >= fail_on` **and**
+  `confidence >= min_confidence` (inclusive on both). Filtering is
+  per-finding, not per-node: a node whose low-confidence HIGH finding is
+  suppressed still violates if it has another gating finding. The comparison
+  is against the finding's own `confidence` as produced by the engine
+  (ADR-0001 §4); the gate adds no confidence model of its own.
+- **Default `0.0` — no filtering.** The flag is opt-in. The out-of-the-box
+  gate therefore cannot miss a real exposure because of a confidence
+  heuristic; teams that raise the threshold do so explicitly, in a reviewable
+  CI config line.
+- **Suppressed findings are always shown, never silently dropped.** Silent
+  suppression in a gate is dangerous: a passing pipeline must be auditable.
+  Every at-or-above-risk finding whose confidence fell below the threshold is
+  surfaced:
+  - in `GateOutcome.suppressed` (the library truth);
+  - in `--format json` under the `suppressed` key — finding objects in the
+    same shape as report findings, each extended with `node_id` and node
+    `name`;
+  - in `--format text` as a dedicated section after the violations, e.g.:
+
+    ```
+    suppressed by --min-confidence 0.75 (not gating): 1 finding
+    [HIGH] mart_customer_dump.email   conf=0.56  origin=raw_customers
+    ```
+
+  - and the verdict line states the count whenever it is non-zero:
+    `result: PASS — no findings at or above HIGH with confidence >= 0.75
+    (1 suppressed below confidence)`. A pass that depended on suppression is
+    thus visibly different from a clean pass in the log, even though both
+    exit 0.
+- **Filtering lives in `evaluate_gate`** (§2), keeping it pure and identical
+  for CLI and library callers; the renderers only display what the outcome
+  already contains, and the CLI maps `tripped` to the exit code as before.
+- **Explicit warning — the false-negative trade.** Confidence is lowered
+  exactly on the heuristic detection paths (pure name matches, aliasing,
+  `SELECT *` inheritance). A non-zero `min-confidence` therefore
+  preferentially suppresses the findings the engine is least certain about —
+  which includes real exposures that merely traveled a heuristic path. The
+  filter trades invisible-by-default false negatives for fewer false alarms;
+  the suppressed section exists so the trade is auditable, and the
+  recommended practice (to be stated in user docs) is to keep `0.0` until a
+  concrete false-positive rate justifies raising it.
 
 ## Consequences
 
@@ -233,7 +305,13 @@ goes to **stdout** in the chosen format; errors and diagnostics go to
   usage shows demand.
 - Warnings not affecting the exit code means a truncated-upstream run can
   exit 0 while its findings are incomplete; mitigated by prominent warning
-  output, revisited in open question 2.
+  output, revisited on evidence (opt-in `--strict-warnings` is the compatible
+  escape hatch).
+- A non-zero `--min-confidence` makes the gate blind to real exposures whose
+  detection was heuristic — a deliberate, user-chosen false-negative risk
+  (§5). Mitigated by the opt-in `0.0` default and by always surfacing
+  suppressed findings; cannot be eliminated while column matching is
+  name-based (ADR-0001 accepted trade-off).
 
 ### Follow-ups
 
@@ -310,27 +388,46 @@ goes to **stdout** in the chosen format; errors and diagnostics go to
     Noisy in CI logs and redundant — anyone wanting the full picture runs
     `report`; `check` shows violations only. Rejected.
 
-## Open questions (to resolve at review, before implementation)
+### Confidence filtering (§5)
 
-1. **`--fail-on` default.** Decided above as *required, no default*;
-   recommendation stands on the compatibility asymmetry (adding a default
-   later is safe, changing one is not). Confirm, or pick a default
-   (`HIGH` would be the candidate) if one-flag-less ergonomics matter more.
-2. **Should warnings affect the exit code?** v1 says no. The sharp edge: the
-   ADR-0002 upstream-truncation warning flags a possible *false-clean* graph
-   — exit 0 on such a run can greenlight a pipeline on incomplete data.
-   Options: (a) keep v1 as decided and revisit on evidence; (b) add
-   `--strict-warnings` (any warning → non-zero) now; (c) make the
-   dangerous-truncation warning specifically trip exit 1. Note that (b)/(c)
-   are compatible *tightenings* only if introduced behind a flag; making them
-   default later changes passing pipelines to failing ones.
-3. **Confidence and the gate.** v1 gates on risk alone. Should a
-   `--min-confidence X` filter ship in this slice (low-confidence HIGH
-   findings stop tripping CI — lower false-positive cost, higher
-   false-negative risk), or stay a backlog item until real usage shows the
-   false-positive rate? Recommendation: defer; the flag is a compatible
-   addition.
-4. **Retroactive alignment of `report`'s error exits** (currently 1 on any
-   `SensiflowError`, becoming 2/3 per the table). Decided above as in-scope
-   for this slice; confirm, since it technically changes existing observable
-   behavior.
+11. **Defer `--min-confidence` to a later release** (ship v1 gating on risk
+    alone; the flag is a compatible addition). This was the draft's original
+    recommendation — conservative, smallest slice. Rejected at review: the
+    false-positive cost of a gate is paid immediately and repeatedly by its
+    adopters, and shipping the control with a `0.0` opt-in default keeps the
+    conservative behavior as the default anyway, so deferral bought nothing
+    but a second release cycle.
+12. **Silent suppression** (filtered findings simply absent from output).
+    Simplest renderer, dangerous gate: a pipeline passing *because* evidence
+    was filtered would be indistinguishable from a clean pass. Rejected —
+    suppressed findings are always surfaced (§5).
+13. **Node-level filtering** (recompute a node's `max_risk` over
+    confidence-eligible findings only, then gate on nodes). Equivalent trip
+    behavior, but it redefines a displayed aggregate (`max_risk`) per policy
+    run and would make `check` output disagree with `report` for the same
+    node. Per-finding filtering leaves all engine outputs untouched.
+    Rejected.
+14. **A distinct exit code for "passed only due to suppression."** Honest
+    idea, but it grows the frozen taxonomy for a state that is already
+    visible in both output formats, and CI cannot do anything with it except
+    what reading the output achieves. Rejected; revisit only with the
+    warnings question if evidence demands a "qualified pass" concept.
+
+## Review resolutions (2026-10-29)
+
+The four questions the draft left open were resolved at review:
+
+1. **`--fail-on` is required, no default** — confirmed as drafted
+   (compatibility asymmetry: a default can be added later, not removed).
+2. **Warnings do not affect the exit code in v1** — confirmed as drafted;
+   warnings are displayed prominently in both formats. The
+   upstream-truncation false-clean edge is acknowledged and will be revisited
+   on evidence; any future tightening (`--strict-warnings` or
+   truncation-trips-gate) must arrive as opt-in first.
+3. **`--min-confidence` ships in this slice** — the draft's deferral
+   recommendation was overruled. Design as specified in §5: per-finding
+   filter inside `evaluate_gate`, opt-in default `0.0`, suppressed findings
+   always surfaced in both formats, false-negative risk recorded as an
+   explicit consequence.
+4. **`report` error-exit alignment (1 → 2/3) is in scope for this slice** —
+   confirmed as drafted.
