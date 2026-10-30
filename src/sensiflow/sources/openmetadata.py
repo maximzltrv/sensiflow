@@ -386,12 +386,12 @@ class OpenMetadataSource:
             )
         if response.status_code >= 400:
             raise SensiflowConnectionError(
-                f"OpenMetadata at {self.host} returned {response.status_code} for {path}"
+                f"OpenMetadata at {self.host} returned {response.status_code}"
             )
         try:
             data: dict[str, Any] = response.json()
         except ValueError:
             raise SensiflowConnectionError(
-                f"invalid JSON from {self.host} for {path}"
+                f"invalid JSON from {self.host}"
             ) from None
         return data

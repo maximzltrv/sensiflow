@@ -253,11 +253,13 @@ def test_openmetadata_without_env_is_503_config_free_of_env_values(
     assert "OMD_" not in body["error"]["message"]
 
 
-def test_openmetadata_bad_host_is_400(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_openmetadata_bad_host_is_503_config(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.setenv("OMD_HOST", "user:pw@catalog.example.test")
     monkeypatch.setenv("OMD_TOKEN", FAKE_OMD_TOKEN)
     response = client.post("/v1/report", json={"source": "openmetadata"})
-    _assert_error(response, 400, "input")
+    _assert_error(response, 503, "config")
     assert "pw@" not in response.text
 
 

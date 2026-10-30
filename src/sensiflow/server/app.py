@@ -40,6 +40,7 @@ logger = logging.getLogger("sensiflow.server")
 _LOG_HANDLER_NAME = "sensiflow.server.stderr"
 _HEALTH_PATH = "/v1/health"
 _MAX_BODY_BYTES = 1024 * 1024  # ADR-0005 §3
+_MAX_DIGITS = 19  # longer than any sane Content-Length; also keeps int() cheap
 
 
 class _CatalogNotConfigured(Exception):
@@ -92,8 +93,27 @@ def _handle_error(_: Request, exc: Exception) -> JSONResponse:
     return _error_response(spec.status, spec.kind, spec.message)
 
 
+def _route_path(scope: Scope) -> str:
+    """The path the router sees: ``scope["path"]`` minus ``root_path``.
+
+    Servers put the mount prefix into ``path`` (uvicorn with ``--root-path``) and
+    Starlette routes on the stripped remainder, so the guard must judge the same
+    string. Mirrors Starlette's own (private) ``get_route_path``.
+    """
+    path: str = scope["path"]
+    root_path: str = scope.get("root_path", "")
+    if not root_path or not path.startswith(root_path):
+        return path
+    if path == root_path:
+        return ""
+    return path[len(root_path) :] if path[len(root_path)] == "/" else path
+
+
 class _GuardMiddleware:
-    """Authentication, then the body-size cap, for everything under ``/v1`` but health.
+    """Authentication, then the body-size cap, for every request but health.
+
+    Deny by default: only the exact health route is exempt, so a route added
+    later (or reached through a path prefix) is guarded without anyone remembering to.
 
     Pure ASGI on purpose: the token is checked before a single body byte is read
     (a ``422`` must never be an unauthenticated schema probe), and the body is
@@ -107,8 +127,7 @@ class _GuardMiddleware:
         self._max_body = max_body
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        path = scope.get("path", "")
-        if scope["type"] != "http" or not path.startswith("/v1/") or path == _HEALTH_PATH:
+        if scope["type"] != "http" or _route_path(scope) == _HEALTH_PATH:
             await self._app(scope, receive, send)
             return
         headers = Headers(scope=scope)
@@ -145,7 +164,14 @@ class _GuardMiddleware:
     async def _read_body(self, headers: Headers, receive: Receive) -> bytes | None:
         """The whole body, or None when it exceeds the cap (declared or streamed)."""
         declared = headers.get("content-length", "")
-        if declared.isdigit() and int(declared) > self._max_body:
+        # ASCII digits only and a bounded length: str.isdigit() accepts superscripts and
+        # int() refuses absurdly long values. Anything else falls back to the streaming cap.
+        if (
+            declared.isascii()
+            and declared.isdigit()
+            and len(declared) <= _MAX_DIGITS
+            and int(declared) > self._max_body
+        ):
             return None
         chunks: list[bytes] = []
         size = 0
@@ -172,7 +198,12 @@ def _make_source(name: str) -> LineageSource:
     # Imported only on demand: the openmetadata extra may be absent.
     from sensiflow.sources.openmetadata import OpenMetadataSource
 
-    return OpenMetadataSource(host, token)
+    try:
+        return OpenMetadataSource(host, token)
+    except SensiflowInputError as exc:
+        # A malformed OMD_HOST is the operator's mistake, not the caller's: 503, details in the log.
+        logger.warning("config error: %s", exc)
+        raise _CatalogNotConfigured from None
 
 
 def _selection_counts(selection: GraphSelection) -> str:
@@ -228,6 +259,10 @@ def _ensure_log_output() -> None:
         logger.addHandler(handler)
         logger.setLevel(logging.INFO)
         logger.propagate = False  # a configured root logger must not print every line twice
+        # The HTTP client logs full request URLs (table names, catalog host) at INFO/DEBUG;
+        # a verbose root logger must not turn that into a log of caller-supplied values.
+        for noisy in ("httpx", "httpcore"):
+            logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
 def _configured_api_token() -> str | None:
