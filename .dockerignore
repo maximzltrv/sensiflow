@@ -1,0 +1,14 @@
+# Allow-list: ignore everything, then re-include only the build inputs.
+# `docker build` ships the working tree, not git, so gitignored local files
+# (notes, .env, agent config) must never be able to enter the build context.
+*
+
+!pyproject.toml
+!poetry.lock
+!README.md
+!LICENSE
+!src/
+
+# Keep caches out even inside the re-included tree.
+**/__pycache__
+**/*.py[cod]
