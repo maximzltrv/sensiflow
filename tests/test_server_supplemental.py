@@ -43,7 +43,7 @@ API_TOKEN = "fake-api-token-qa-0123"
 OTHER_TOKEN = "fake-api-token-qa-4567"
 
 #: kinds the error body may carry: ADR-0005 §4's set plus the 401 "auth" kind.
-ALLOWED_ERROR_KINDS = {"input", "connection", "dependency", "internal", "auth"}
+ALLOWED_ERROR_KINDS = {"input", "connection", "dependency", "internal", "auth", "config"}
 
 
 @pytest.fixture(autouse=True)
@@ -231,7 +231,11 @@ def test_every_error_body_uses_a_known_kind(monkeypatch: pytest.MonkeyPatch) -> 
     with TestClient(create_app(), raise_server_exceptions=False) as test_client:
         responses = [
             test_client.post("/v1/report", json={"source": "mock"}),  # 401
-            test_client.post("/v1/check", json={"source": "mock", "fail_on": "x"}, headers=auth),
+            test_client.post(
+                "/v1/check",
+                json={"source": "mock", "fail_on": "HIGH", "min_confidence": 2.0},
+                headers=auth,
+            ),
             test_client.post("/v1/report", json={"source": "openmetadata"}, headers=auth),
         ]
         for exc in (RuntimeError("x"), SensiflowInputError("x")):
@@ -274,20 +278,16 @@ def test_token_in_query_string_is_not_accepted(monkeypatch: pytest.MonkeyPatch) 
     _assert_error(response, 401, "auth")
 
 
-def test_whitespace_only_token_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Unlike the empty string, a whitespace-only value is "set": the API must not open.
-    monkeypatch.setenv("SENSIFLOW_API_TOKEN", "   ")
-    with TestClient(create_app()) as authed:
-        for headers in ({}, {"Authorization": "Bearer "}, {"Authorization": "Bearer x"}):
-            response = authed.post("/v1/report", json={"source": "mock"}, headers=headers)
-            assert response.status_code == 401
-
-
-def test_empty_token_still_warns_that_the_api_is_open(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_blank_token_refuses_to_start_rather_than_opening_the_api(
+    monkeypatch: pytest.MonkeyPatch, blank: str
 ) -> None:
-    # An empty value opens the API; that must never be silent.
-    monkeypatch.setenv("SENSIFLOW_API_TOKEN", "")
+    monkeypatch.setenv("SENSIFLOW_API_TOKEN", blank)
+    with pytest.raises(SensiflowInputError):
+        create_app()
+
+
+def test_unset_token_warns_that_the_api_is_open(caplog: pytest.LogCaptureFixture) -> None:
     with caplog.at_level(logging.WARNING, logger="sensiflow.server"):
         create_app()
     assert any("OPEN" in r.getMessage() for r in caplog.records)
@@ -321,26 +321,30 @@ def test_api_token_is_bound_per_app_at_creation(monkeypatch: pytest.MonkeyPatch)
             assert test_client.post("/v1/report", json=body).status_code == 401
 
 
-def test_invalid_json_without_token_leaks_no_schema(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Invalid JSON is rejected by the framework before the auth dependency runs
-    # (422, not 401); the body must at least reveal nothing about the schema.
+def test_invalid_json_without_token_is_401_and_leaks_no_schema(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("SENSIFLOW_API_TOKEN", API_TOKEN)
     with TestClient(create_app()) as authed:
         response = authed.post(
             "/v1/check", content=b"{not json", headers={"content-type": "application/json"}
         )
-    assert response.status_code in (401, 422)
+    _assert_error(response, 401, "auth")
     for field in ("source", "selection", "fail_on", "min_confidence", "dialect"):
         assert field not in response.text
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "QA defect: the auth scheme match is case-sensitive; RFC 7235 §2.1 makes "
-        "the scheme token case-insensitive, so 'bearer <token>' must be accepted"
-    ),
-)
+def test_invalid_json_with_token_is_422(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SENSIFLOW_API_TOKEN", API_TOKEN)
+    with TestClient(create_app()) as authed:
+        response = authed.post(
+            "/v1/check",
+            content=b"{not json",
+            headers={"content-type": "application/json", "Authorization": f"Bearer {API_TOKEN}"},
+        )
+    assert response.status_code == 422
+
+
 def test_bearer_scheme_is_case_insensitive(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SENSIFLOW_API_TOKEN", API_TOKEN)
     with TestClient(create_app()) as authed:
@@ -426,13 +430,6 @@ def test_check_schema_rejects_out_of_contract_bodies(
     assert response.status_code == 422
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "QA defect: pydantic lax mode coerces JSON true to min_confidence=1.0, which "
-        "suppresses every finding and silently un-trips the gate (fail-open on a type error)"
-    ),
-)
 def test_boolean_min_confidence_is_rejected(client: TestClient) -> None:
     response = client.post(
         "/v1/check", json={"source": "mock", "fail_on": "HIGH", "min_confidence": True}
@@ -450,14 +447,10 @@ def test_out_of_range_min_confidence_is_400_never_clean(client: TestClient, lite
     assert "min-confidence" in body["error"]["message"]
 
 
-@pytest.mark.parametrize("fail_on", ["high", "High", "ORIGIN", "NONE", ""])
-def test_non_canonical_fail_on_is_400_naming_the_valid_values(
-    client: TestClient, fail_on: str
-) -> None:
-    # The library is case-sensitive; the HTTP door passes values through unchanged.
+@pytest.mark.parametrize("fail_on", ["ORIGIN", "NONE", ""])
+def test_non_threshold_fail_on_is_422(client: TestClient, fail_on: str) -> None:
     response = client.post("/v1/check", json={"source": "mock", "fail_on": fail_on})
-    body = _assert_error(response, 400, "input")
-    assert "LOW, MEDIUM, HIGH" in body["error"]["message"]
+    assert response.status_code == 422
 
 
 @pytest.mark.parametrize(
@@ -490,14 +483,22 @@ def test_selection_semantics_come_from_graph_selection(
     assert body["error"]["message"] == str(excinfo.value)
 
 
-def test_large_selection_is_served(
+def test_selection_at_the_roots_cap_is_served_and_beyond_it_is_422(
     client: TestClient, caplog: pytest.LogCaptureFixture
 ) -> None:
-    roots = [f"stg_table_{i:05d}" for i in range(5000)]
+    over = [f"stg_table_{i:05d}" for i in range(1001)]
+    rejected = client.post("/v1/report", json={"source": "mock", "selection": {"roots": over}})
+    assert rejected.status_code == 422
+    patterns = [f"stg_{i}_*" for i in range(101)]
+    rejected = client.post(
+        "/v1/report", json={"source": "mock", "selection": {"patterns": patterns}}
+    )
+    assert rejected.status_code == 422
+    roots = over[:1000]
     with caplog.at_level(logging.INFO, logger="sensiflow.server"):
         response = client.post("/v1/report", json={"source": "mock", "selection": {"roots": roots}})
     assert response.status_code == 200
-    assert any("roots=5000" in r.getMessage() for r in caplog.records)
+    assert any("roots=1000" in r.getMessage() for r in caplog.records)
 
 
 # -- cross-front-door agreement (HTTP vs CLI over the same library) ----------------
@@ -599,5 +600,5 @@ def test_server_logger_handler_is_installed_once_across_many_apps() -> None:
     logger = logging.getLogger("sensiflow.server")
     for _ in range(5):
         create_app()
-    stream_handlers = [h for h in logger.handlers if isinstance(h, logging.StreamHandler)]
-    assert len(stream_handlers) == 1
+    ours = [h for h in logger.handlers if h.get_name() == "sensiflow.server.stderr"]
+    assert len(ours) == 1

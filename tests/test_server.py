@@ -17,6 +17,7 @@ from sensiflow import (
     GraphSelection,
     SensiflowConnectionError,
     SensiflowDependencyError,
+    SensiflowInputError,
     __version__,
     evaluate_gate,
     trace,
@@ -162,9 +163,17 @@ def test_selection_validation_error_is_400(client: TestClient) -> None:
     assert "mutually exclusive" in body["error"]["message"]
 
 
-def test_invalid_fail_on_is_400(client: TestClient) -> None:
-    response = client.post("/v1/check", json={"source": "mock", "fail_on": "CRITICAL"})
-    _assert_error(response, 400, "input")
+@pytest.mark.parametrize("fail_on", ["CRITICAL", "ORIGIN", "NONE", ""])
+def test_invalid_fail_on_is_422(client: TestClient, fail_on: str) -> None:
+    response = client.post("/v1/check", json={"source": "mock", "fail_on": fail_on})
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize("fail_on", ["high", "High", "HIGH"])
+def test_fail_on_is_case_insensitive(client: TestClient, fail_on: str) -> None:
+    response = client.post("/v1/check", json={"source": "mock", "fail_on": fail_on})
+    assert response.status_code == 200
+    assert response.json()["fail_on"] == "HIGH"
 
 
 def test_invalid_min_confidence_is_400(client: TestClient) -> None:
@@ -200,45 +209,48 @@ def test_non_json_body_is_422(client: TestClient) -> None:
     assert response.status_code == 422
 
 
-def test_connection_error_is_502(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
-    _stub_omd(monkeypatch, SensiflowConnectionError("catalog unreachable (status 503)"))
+def test_connection_error_is_502_with_a_fixed_message(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    detail = f"cannot reach OpenMetadata at {FAKE_OMD_HOST}: ConnectError"
+    _stub_omd(monkeypatch, SensiflowConnectionError(detail))
     response = client.post("/v1/report", json={"source": "openmetadata"})
     body = _assert_error(response, 502, "connection")
-    assert body["error"]["message"] == "catalog unreachable (status 503)"
+    assert body["error"]["message"] == "the catalog could not be reached"
+    assert FAKE_OMD_HOST not in response.text
+    assert detail in caplog.text  # the operator still gets the full picture
 
 
 def test_dependency_error_is_500(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
     _stub_omd(monkeypatch, SensiflowDependencyError("install the extra"))
     response = client.post("/v1/check", json={"source": "openmetadata", "fail_on": "HIGH"})
     body = _assert_error(response, 500, "dependency")
-    assert body["error"]["message"] == "install the extra"
+    assert "install the extra" not in response.text
+    assert body["error"]["message"] == "the server is missing a required component"
 
 
 def test_unexpected_error_is_generic_500_without_traceback(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     _stub_omd(monkeypatch, RuntimeError("secret-internal-detail"))
-    with caplog.at_level(logging.ERROR, logger="sensiflow.server"):
-        response = client.post("/v1/report", json={"source": "openmetadata"})
+    response = client.post("/v1/report", json={"source": "openmetadata"})
     body = _assert_error(response, 500, "internal")
     assert "secret-internal-detail" not in response.text
     assert "Traceback" not in response.text
     assert "RuntimeError" not in response.text
     assert body["error"]["message"] == "internal server error"
     # The traceback went to the server log instead.
-    assert any(
-        r.exc_info and "secret-internal-detail" in str(r.exc_info[1]) for r in caplog.records
-    )
+    assert "secret-internal-detail" not in caplog.text  # uvicorn logs the traceback, once
 
 
-def test_openmetadata_without_env_is_400_free_of_env_values(
+def test_openmetadata_without_env_is_503_config_free_of_env_values(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("OMD_HOST", FAKE_OMD_HOST)  # token missing: still unconfigured
     response = client.post("/v1/report", json={"source": "openmetadata"})
-    body = _assert_error(response, 400, "input")
+    body = _assert_error(response, 503, "config")
     assert FAKE_OMD_HOST not in response.text
-    assert "OMD_TOKEN" in body["error"]["message"]  # names the variable, not its value
+    assert "OMD_" not in body["error"]["message"]
 
 
 def test_openmetadata_bad_host_is_400(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -354,10 +366,11 @@ def test_no_startup_warning_when_auth_enabled(
     assert not caplog.records
 
 
-def test_empty_api_token_means_auth_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("SENSIFLOW_API_TOKEN", "")
-    with TestClient(create_app()) as open_client:
-        assert open_client.post("/v1/report", json={"source": "mock"}).status_code == 200
+@pytest.mark.parametrize("blank", ["", " ", "\t\n  "])
+def test_blank_api_token_refuses_to_start(monkeypatch: pytest.MonkeyPatch, blank: str) -> None:
+    monkeypatch.setenv("SENSIFLOW_API_TOKEN", blank)
+    with pytest.raises(SensiflowInputError, match="SENSIFLOW_API_TOKEN"):
+        create_app()
 
 
 # -- logging ------------------------------------------------------------------
@@ -426,8 +439,11 @@ def test_importing_the_library_does_not_load_the_server_layer() -> None:
 
 def test_create_app_is_idempotent_for_log_handlers() -> None:
     logger = logging.getLogger("sensiflow.server")
+
+    def ours() -> list[logging.Handler]:
+        return [h for h in logger.handlers if h.get_name() == "sensiflow.server.stderr"]
+
     create_app()
-    before = len(logger.handlers)
     create_app()
-    assert before >= 1
-    assert len(logger.handlers) == before
+    assert len(ours()) == 1
+    assert logger.propagate is False

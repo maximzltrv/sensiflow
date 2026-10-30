@@ -9,16 +9,53 @@ import pytest
 
 from sensiflow.cli import ExitCode, main
 
+_SERVER_STACK = ("sensiflow.server", "fastapi", "starlette", "pydantic")
 
-@pytest.mark.parametrize("missing", ["sensiflow.server", "uvicorn"])
+
+def _hide_server_stack(monkeypatch: pytest.MonkeyPatch, missing: str) -> None:
+    """Simulate an install without ``missing``: drop cached modules, block the import.
+
+    The whole server stack is dropped from the module cache so the lazy import in
+    ``serve`` really re-executes (a cached ``fastapi`` would mask a missing starlette).
+    """
+    for name in list(sys.modules):
+        if any(name == root or name.startswith(f"{root}.") for root in _SERVER_STACK):
+            monkeypatch.delitem(sys.modules, name)
+    monkeypatch.setitem(sys.modules, missing, None)  # the import raises ModuleNotFoundError
+
+
+@pytest.mark.parametrize("missing", ["fastapi", "uvicorn", "starlette", "pydantic"])
 def test_serve_missing_extra_exits_3_with_hint(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], missing: str
 ) -> None:
-    monkeypatch.setitem(sys.modules, missing, None)  # makes the import raise ImportError
+    _hide_server_stack(monkeypatch, missing)
     assert main(["serve"]) == ExitCode.OPERATIONAL_ERROR
     err = capsys.readouterr().err
     assert "pip install 'sensiflow[server]'" in err
     assert "Traceback" not in err
+
+
+def test_serve_does_not_mask_unrelated_import_errors(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A broken sensiflow module is a bug, not a missing extra: no install hint.
+    _hide_server_stack(monkeypatch, "sensiflow.server.schemas")
+    assert main(["serve"]) == ExitCode.OPERATIONAL_ERROR
+    err = capsys.readouterr().err
+    assert "pip install" not in err
+    assert "Traceback" in err
+
+
+def test_serve_blank_api_token_is_exit_2(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import uvicorn
+
+    monkeypatch.setattr(uvicorn, "run", lambda *a, **k: pytest.fail("must not start serving"))
+    for blank in ("", "   "):
+        monkeypatch.setenv("SENSIFLOW_API_TOKEN", blank)
+        assert main(["serve"]) == ExitCode.INPUT_ERROR
+        assert "SENSIFLOW_API_TOKEN" in capsys.readouterr().err
 
 
 def test_serve_runs_uvicorn_with_defaults(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -283,6 +283,10 @@ def _run_check(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
     return _guarded(compute)
 
 
+#: Top-level modules the [server] extra provides; their absence means the extra is missing.
+_SERVER_DEPENDENCIES = frozenset({"fastapi", "uvicorn", "starlette", "pydantic"})
+
+
 def _run_serve(args: argparse.Namespace) -> int:
     def compute() -> tuple[str, ExitCode]:
         # Imported only on demand: the base install has no fastapi/uvicorn.
@@ -290,7 +294,11 @@ def _run_serve(args: argparse.Namespace) -> int:
             import uvicorn
 
             from sensiflow.server import create_app
-        except ImportError as exc:
+        except ModuleNotFoundError as exc:
+            # Only a missing server dependency means "extra not installed"; any other
+            # import failure is a real bug and must surface as one.
+            if (exc.name or "").partition(".")[0] not in _SERVER_DEPENDENCIES:
+                raise
             raise SensiflowDependencyError(
                 "the HTTP server needs the server extra: pip install 'sensiflow[server]'"
             ) from exc
