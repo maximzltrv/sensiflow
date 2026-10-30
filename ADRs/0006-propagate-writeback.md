@@ -698,6 +698,15 @@ specific Automated+Suggested PII label (never positionally the first
 `PII.*` label on the column, which may be a human's), and the pre-patch
 live re-check applies the same three-part test.
 
+When several `PII.*` labels coexist on one column, the marker plus the one
+Automated+Suggested label identify the managed slot and only that slot may
+ever be written; all other labels are human and untouchable. If no label
+passes the test, the whole column is human authority. Residual accepted
+case: the tool may update *its own* suggested label to a value that
+disagrees with a coexisting human-confirmed label — the human label is
+never modified, and OpenMetadata's mutually exclusive PII classification
+prevents such coexistence in normal operation.
+
 *How one OpenMetadata column's existing markup is classified for the diff:*
 
 ```mermaid
@@ -871,6 +880,10 @@ following are contractual, not incidental:
   operations pinning the column name (and, on `replace`, the tag at the
   target slot), plus `If-Match` with the re-fetch's ETag; a 412 or failed
   test skips that table's changes ("modified concurrently; re-run").
+  Documented limitation: the server reports a failed `test` operation as a
+  plain 400, so it is recognized heuristically (a 400 whose message names a
+  failed test); a misread in either direction is benign — a skip re-runs
+  and converges, and a persistent skip is visible on every run.
 - **Rendered output**: every catalog-derived field in every text renderer
   is escaped for control, C1, and bidirectional-override sequences — the
   dry-run document is what the human approves; it must not be spoofable.
