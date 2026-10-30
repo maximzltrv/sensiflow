@@ -1,7 +1,8 @@
 # ADR-0005: HTTP server API and distributable Docker image
 
 - **Status:** Accepted (2026-10-30, after review; all five open questions
-  resolved — see Review resolutions)
+  resolved — see Review resolutions; amended 2026-10-30 after verification —
+  see Post-verification amendments)
 - **Date:** 2026-10-30
 - **Deciders:** Maksim Zolotarev
 
@@ -171,10 +172,33 @@ query string; URLs are also logged by every proxy on the path, and the
 request shape must stay safe to log. The operations remain strictly
 read-only regardless of the verb.
 
+**Field validation rules.** Request models are strict in both senses:
+unknown fields are rejected (`extra="forbid"`), and types are not coerced —
+`"min_confidence": true` is a `422`, never a silent `1.0`. `fail_on` is a
+closed enum (`LOW` / `MEDIUM` / `HIGH`) in the schema and in the OpenAPI
+document; it is matched case-insensitively and normalized to upper case
+before reaching the gate — the same normalization the CLI applies
+(`type=str.upper`), so `"high"` and `"HIGH"` are the same request. `dialect`
+is validated against sqlglot's dialect registry; an unknown dialect is an
+input error (`400` here, exit 2 in the CLI), never a silent fallback that
+would quietly weaken the gate.
+
+**Request limits (v1).** Request bodies are capped at **1 MiB** (enforced
+before parsing; oversized requests get `413`), `roots` is capped at **1000**
+entries and `patterns` at **100** — generous for real selections, bounded
+against abuse. A per-request wall-clock deadline is a documented **non-goal**
+for v1: the sync worker model has no clean in-process cancellation, and
+deployments terminate long requests at the reverse proxy, which owns
+timeouts anyway.
+
 `source: "mock"` is served like everywhere else, giving a catalog-free smoke
 test of a live deployment: `POST /v1/check {"source": "mock", "fail_on":
 "HIGH"}` must trip. The dbt source is **not** reachable over HTTP in v1 —
-see Decision 5 and Alternatives 8–9.
+see Decision 5 and Alternatives 8–9. The `source` enum in the request schema
+(`"openmetadata" | "mock"`) is the enforcement point of that deferral: dbt —
+and any future file-based source — is deliberately absent from it, and
+adding a value to this enum is an API decision recorded in an ADR, not a
+schema edit that rides along with a connector.
 
 ### 4. Outcome-to-HTTP mapping — the taxonomy transported, not redefined
 
@@ -185,11 +209,36 @@ versioned with the API:
 |--------------------|----------|-------------|------|
 | Run completed, below threshold | 0 | `200` | check/report document, `"tripped": false` |
 | Gate tripped | 1 | `200` | check document, `"tripped": true` |
-| Usage / input error (`SensiflowInputError`, incl. cyclic graph, zero-match pattern) | 2 | `400` | structured error body |
+| Usage / input error (`SensiflowInputError`, incl. cyclic graph, zero-match pattern, unknown dialect) | 2 | `400` | structured error body, kind `input` |
+| Missing or invalid API token (when `SENSIFLOW_API_TOKEN` is set) | n/a | `401` | structured error body, kind `auth`, plus `WWW-Authenticate: Bearer` |
+| Request body exceeds the size cap | n/a | `413` | structured error body, kind `input` |
 | Malformed request body (framework validation) | 2 | `422` | FastAPI's native validation document |
-| Catalog unreachable / catalog auth failure (`SensiflowConnectionError`) | 3 | `502` | structured error body |
-| Server deployment lacks a required extra (`SensiflowDependencyError`) | 3 | `500` | structured error body |
-| Unexpected internal error | 3 | `500` | structured error body (generic; traceback goes to the server log only, never to the client) |
+| Requested source not configured on this deployment (e.g. `openmetadata` without `OMD_HOST`/`OMD_TOKEN`) | n/a — in the CLI the caller *is* the operator, so it is a usage error, exit 2 | `503` | structured error body, kind `config` |
+| Catalog unreachable / catalog auth failure (`SensiflowConnectionError`) | 3 | `502` | structured error body, kind `connection` (fixed generic message) |
+| Server deployment lacks a required extra (`SensiflowDependencyError`) | 3 | `500` | structured error body, kind `dependency` (fixed generic message) |
+| Unexpected internal error | 3 | `500` | structured error body, kind `internal` (generic; traceback goes to the server log only, never to the client) |
+
+Two mapping rules deserve their reasoning on record:
+
+- **Server-side misconfiguration is `5xx`, never `400`.** When a request
+  names `openmetadata` but the deployment has no `OMD_HOST`/`OMD_TOKEN`, the
+  HTTP caller cannot fix anything — by Decision 5 the request *cannot* carry
+  credentials. `400` would tell the caller "your request is wrong" about a
+  request that is perfectly well-formed; monitoring would file an operator
+  problem under client errors. `503` says exactly what is true: this
+  deployment cannot serve that source until an operator configures it. The
+  CLI legitimately differs (usage error, exit 2) because there the caller
+  and the operator are the same person at the same keyboard.
+- **Check precedence**: authentication runs before the body is read, so an
+  unauthorized request is `401` even when its body is also oversized or
+  malformed; the order is `401` → `413` → `422` → everything else. (A `422`
+  must never be a way for an unauthenticated caller to probe the schema.)
+
+Routing-level errors that never reach a `/v1` handler (`404` unknown path,
+`405` wrong method) keep FastAPI's native `{"detail": ...}` shape: they are
+framework territory, carry no sensiflow semantics, and unifying them would
+mean owning the framework's error surface. The structured
+`{"error": {...}}` contract applies to the analysis endpoints' outcomes.
 
 The pivotal row: **a tripped gate is `200`, not an error status.** HTTP
 status codes describe whether the *request* was served, not the domain
@@ -206,10 +255,15 @@ Structured error body, additive-only like every other machine document:
 {"error": {"kind": "input", "message": "root pattern 'demo.wh.crm.*' matched no tables"}}
 ```
 
-`kind` is one of `input` / `connection` / `dependency` / `internal`.
-Messages reuse the library's exception messages, which are already
-secret-free by construction (ADR-0002 §5); tracebacks and upstream response
-bodies never appear in a client-facing error.
+`kind` is one of `input` / `auth` / `config` / `connection` / `dependency` /
+`internal`. Message policy by kind: `input` errors reuse the library's
+exception messages verbatim — they describe the caller's own request and are
+host- and secret-free by construction (ADR-0002 §5). `connection`,
+`dependency`, `config`, and `internal` errors return **fixed generic
+messages**: their library-level details describe the *deployment* (catalog
+host, missing packages), which is the operator's business, not the HTTP
+caller's — the full exception goes to the server log only. Tracebacks and
+upstream response bodies never appear in a client-facing error.
 
 *Diagram: one `POST /v1/check` request end to end — where credentials enter
 (server env, never the request) and where the outcome taxonomy becomes an
@@ -232,14 +286,15 @@ sequenceDiagram
     S->>L: trace(graph), evaluate_gate(result, fail_on), render
     L-->>S: check document with tripped flag
     S-->>C: 200 + render_check_json body (tripped true or false)
-    Note over C,S: errors: SensiflowInputError -> 400, SensiflowConnectionError -> 502, SensiflowDependencyError or unexpected -> 500 (traceback to server log only)
+    Note over C,S: errors: bad token -> 401, SensiflowInputError -> 400, catalog not configured -> 503, SensiflowConnectionError -> 502, SensiflowDependencyError or unexpected -> 500 (details to server log only)
 ```
 
 ### 5. Catalog credentials are server-side configuration — never per-request
 
-The deployment binds exactly one catalog at startup via the existing
-environment variables (`OMD_HOST`, `OMD_TOKEN`). Request bodies carry **no**
-host and **no** token. The connector's host validation (http/https scheme
+The deployment binds exactly one catalog via the existing environment
+variables (`OMD_HOST`, `OMD_TOKEN`); the server reads them from its own
+environment when a request first needs the catalog (mock-only deployments
+need neither). Request bodies carry **no** host and **no** token. The connector's host validation (http/https scheme
 required, no userinfo) applies unchanged at first use.
 
 This is the central security decision of the API, chosen over per-request
@@ -311,9 +366,17 @@ what is it doing" minimum. Revisit on operational evidence.
 **API authentication (decided at review):** the server ships an opt-in
 static bearer token — if `SENSIFLOW_API_TOKEN` is set in the environment,
 every `/v1/report` and `/v1/check` request must carry
-`Authorization: Bearer <token>` (constant-time comparison); `/v1/health`
-stays open for probes. If unset, the API is open and the server logs a
-prominent startup warning. Rationale: the server fronts a catalog
+`Authorization: Bearer <token>` (constant-time comparison; the `Bearer`
+scheme name is matched case-insensitively per RFC 7235, the token itself is
+exact); `/v1/health` stays open for probes. The check runs in middleware,
+**before the request body is read** — authentication failures are never
+preceded by body parsing or validation. If the variable is unset, the API is
+open and the server logs a prominent startup warning; if it is **set but
+blank**, the server refuses to start — a blank token is always a
+configuration mistake, and silently running open would turn a typo into an
+exposure. When a token is configured, `/docs` and `/openapi.json` are
+disabled: an unauthenticated caller gets no schema to probe (the OpenAPI
+document is available to operators from an unauthenticated local run). Rationale: the server fronts a catalog
 credential, so a zero-cost shared-secret guard is worth having from day one,
 while mandatory auth would complicate the local/demo path (see Review
 resolution 1 and Alternatives: "no auth at all" and "mandatory token" were
@@ -551,3 +614,48 @@ The five questions the draft left open were resolved at review:
    repository CI exists; not part of this slice.
 5. **No compose file in v1 confirmed**; the OpenMetadata-sandbox demo
    compose (with synthetic seed data) goes to the backlog as its own item.
+
+## Post-verification amendments (2026-10-30)
+
+Rulings from the verification review of the first implementation, folded
+into the sections above; recorded here so the deltas against the originally
+accepted text are explicit:
+
+1. **§4 table extended** with the `401` (kind `auth`), `413` (oversized
+   body), and `503` (kind `config`, catalog not configured on the
+   deployment) rows. The `503` row *changes* the implemented behavior, which
+   had mapped server-side missing catalog configuration to `400`/`input`:
+   a caller who cannot carry credentials (Decision 5) cannot fix that
+   condition, so it is not a client error. The table remains contract.
+2. **Error message policy split by kind** (§4): `input` reuses library
+   messages; `connection` / `dependency` / `config` / `internal` return
+   fixed generic messages with details only in the server log — library
+   connection errors name the catalog host, which is deployment-internal
+   information the client has no business receiving.
+3. **`fail_on` is a case-insensitively matched enum** normalized to upper
+   case (§3), matching CLI behavior and giving OpenAPI a proper enum;
+   request models are non-coercing (strict types), so booleans can never
+   leak into `min_confidence`.
+4. **Auth hardening** (§7): token check in middleware before body read
+   (fixing `422`-before-`401` ordering), blank-but-set
+   `SENSIFLOW_API_TOKEN` refuses startup, interactive docs disabled when a
+   token is configured.
+5. **Request limits made concrete** (§3): 1 MiB body cap (`413`), 1000
+   roots / 100 patterns; per-request deadline declared a v1 non-goal
+   (reverse proxy's job).
+6. **`dialect` validated against sqlglot's registry** (§3) in the library,
+   so an unknown dialect is a `400` here and exit 2 in the CLI instead of a
+   silent degradation that weakens the gate.
+7. **Credential wording aligned to behavior** (§5): the catalog environment
+   variables are read when first needed, not at process start; the
+   one-deployment-one-catalog stance is unchanged.
+8. **`source` enum documented as the dbt-deferral enforcement point** (§3):
+   extending it is an ADR-level API decision.
+9. **Routing-level `404`/`405` keep the framework's `{"detail": ...}`
+   shape** (§4), documented rather than unified.
+10. **Extras pinning policy noted:** optional-extra dependencies use lower
+    bounds only (no upper caps) — caps in a library create resolver
+    conflicts for host applications; the sole caret constraint stays on
+    sqlglot, whose AST internals the core consumes directly. Floor
+    constraints on security-relevant transitive packages (`h11`, `anyio`)
+    are carried explicitly.
