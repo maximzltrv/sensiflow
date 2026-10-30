@@ -25,6 +25,30 @@ from sensiflow.exceptions import SensiflowDependencyError, SensiflowInputError
 _DEFAULT_INDENT = (2, 4, 2)  # mapping, sequence, offset: the common dbt layout
 _SIGNIFICANT = re.compile(r"^(?P<indent> *)(?P<rest>[^ #\n].*)$")
 
+#: Plain scalars a YAML 1.1 reader (PyYAML, dbt) resolves to a bool/null/number although
+#: ruamel's 1.2 dumper emits them bare.
+_YAML11_WORDS = frozenset({"y", "n", "yes", "no", "on", "off", "true", "false", "null", "~"})
+_NUMBER_LIKE = re.compile(r"[-+]?\.?\d")
+
+
+def _split_document_start(text: str) -> tuple[str, str]:
+    """Split ``text`` into ``(header, body)`` around a bare ``---`` line.
+
+    The header is every line up to and including the ``---`` when only blank
+    and comment lines precede it (e.g. a language-server schema comment); it
+    is kept verbatim because ruamel would drop comments that sit above the
+    document start. ``("", text)`` when there is no such marker.
+    """
+    lines = text.splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped == "---" and line.rstrip("\r\n") == "---":
+            return "".join(lines[: index + 1]), "".join(lines[index + 1 :])
+        break
+    return "", text
+
 
 def require_ruamel(
     import_module: Callable[[str], ModuleType] = importlib.import_module,
@@ -74,27 +98,44 @@ class PropertiesFile:
         self._yaml.width = 1 << 20  # never re-wrap long descriptions
         mapping, sequence, offset = detect_indent(text)
         self._yaml.indent(mapping=mapping, sequence=sequence, offset=offset)
-        self._yaml.explicit_start = text.lstrip().startswith("---")
+        # Preserve the file's own line endings: ruamel emits "\n", so remember CRLF.
+        self._newline = "\r\n" if "\r\n" in text else "\n"
+        text = text.replace("\r\n", "\n")
+        self._header, text = _split_document_start(text)
+        self._scalarstring = importlib.import_module("ruamel.yaml.scalarstring")
         try:
             self.document: Any = self._yaml.load(text)
         except yaml_mod.YAMLError as exc:
             # Parser messages quote file content; the error type is enough to act on.
             raise SensiflowInputError(f"not valid YAML ({type(exc).__name__})") from None
+        self._yaml_error: type[Exception] = yaml_mod.YAMLError
         if self.document is not None:
-            self._pin_anchors(self.document)
+            self._pin_anchors(self.document, set())
 
     @classmethod
-    def read(cls, path: Path) -> PropertiesFile:
-        text = path.read_text(encoding="utf-8")
+    def read(cls, path: Path, label: str | None = None) -> PropertiesFile:
+        """Parse a file; ``label`` names it in errors (callers pass a project-relative path)."""
+        # Bytes, not read_text: universal newlines would hide CRLF from the parser.
+        text = path.read_bytes().decode("utf-8")
         try:
             return cls(text)
         except SensiflowInputError as exc:
-            raise SensiflowInputError(f"{path}: {exc}") from None
+            raise SensiflowInputError(f"{label or path.name}: {exc}") from None
 
     def render(self) -> str:
         buffer = io.StringIO()
-        self._yaml.dump(self.document, buffer)
-        return buffer.getvalue()
+        try:
+            self._yaml.dump(self.document, buffer)
+        except self._yaml_error as exc:
+            raise SensiflowInputError(f"cannot serialize YAML ({type(exc).__name__})") from None
+        text = self._header + buffer.getvalue()
+        return text.replace("\n", self._newline) if self._newline != "\n" else text
+
+    def scalar(self, value: str) -> Any:
+        """A string safe for YAML 1.1 readers: force quotes where bare would change type."""
+        if not value or value.lower() in _YAML11_WORDS or _NUMBER_LIKE.match(value):
+            return self._scalarstring.DoubleQuotedScalarString(value)
+        return value
 
     # -- navigation -------------------------------------------------------------
 
@@ -107,12 +148,15 @@ class PropertiesFile:
                 return entry
         return None
 
-    def find_column(self, entry: Any, name: str) -> Any | None:
-        for column in _items(entry.get("columns")):
-            col_name = column.get("name") if self.is_map(column) else None
-            if isinstance(col_name, str) and col_name.lower() == name.lower():
-                return column
-        return None
+    def columns_named(self, entry: Any, name: str) -> list[Any]:
+        """Every column entry called ``name`` (case-insensitive); more than one is ambiguous."""
+        return [
+            column
+            for column in _items(entry.get("columns"))
+            if self.is_map(column)
+            and isinstance(column.get("name"), str)
+            and column["name"].lower() == name.lower()
+        ]
 
     def columns(self, entry: Any) -> list[Any]:
         return [c for c in _items(entry.get("columns")) if self.is_map(c)]
@@ -130,7 +174,7 @@ class PropertiesFile:
 
     def add_column(self, entry: Any, name: str) -> Any:
         """Append a bare ``- name: <name>`` column entry, creating ``columns`` if needed."""
-        column = self.new_map(name=name)
+        column = self.new_map(name=self.scalar(name))
         columns = entry.get("columns")
         if isinstance(columns, self._comments.CommentedSeq):
             self._append_to_seq(columns, column)
@@ -162,8 +206,14 @@ class PropertiesFile:
         seq.append(item)
         _give_trailing(seq, token, self._comments)
 
-    def _pin_anchors(self, node: Any) -> None:
-        """Keep anchors nothing aliases: ruamel would otherwise drop them on dump."""
+    def _pin_anchors(self, node: Any, seen: set[int]) -> None:
+        """Keep anchors nothing aliases: ruamel would otherwise drop them on dump.
+
+        ``seen`` guards against cycles (a self-referencing alias would recurse forever).
+        """
+        if id(node) in seen:
+            return
+        seen.add(id(node))
         anchor = getattr(node, "yaml_anchor", lambda: None)()
         if anchor is not None:
             anchor.always_dump = True
@@ -174,7 +224,7 @@ class PropertiesFile:
         else:
             return
         for child in children:
-            self._pin_anchors(child)
+            self._pin_anchors(child, seen)
 
 
 def _items(node: Any) -> list[Any]:

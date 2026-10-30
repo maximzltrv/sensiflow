@@ -10,10 +10,8 @@ which is what proves the YAML files, not the manifest, are the diff baseline.
 
 from __future__ import annotations
 
-import difflib
 import json
 import os
-import shutil
 from pathlib import Path
 from typing import Any
 
@@ -24,10 +22,10 @@ from sensiflow import (
     ApplyResult,
     ExistingTag,
     PiiTag,
+    Risk,
     SensiflowDependencyError,
     SensiflowInputError,
     TagChange,
-    WritebackDiff,
     apply_writeback,
     diff_writeback,
     plan_writeback,
@@ -36,9 +34,9 @@ from sensiflow import (
 from sensiflow.cli import main
 from sensiflow.sources import _dbt_yaml
 from sensiflow.sources._dbt_yaml import PropertiesFile, detect_indent
-from sensiflow.sources.dbt import DbtSource, _declared_pii
+from sensiflow.sources.dbt import DbtSource, _declared_pii, _parse_column
+from tests.support import actions, make_source, regenerate_manifest, removed_lines, run_diff
 
-FIXTURE = Path(__file__).parent / "fixtures" / "dbt_project"
 P = "demo_shop"
 RAW = f"source.{P}.crm.raw_customers"
 STG = f"model.{P}.stg_customers"
@@ -48,55 +46,6 @@ UNDOC = f"model.{P}.mart_undocumented"
 PKG = "model.vendor_pkg.pkg_model"
 STAGING_YML = "models/staging/schema.yml"
 MARTS_YML = "models/marts/schema.yml"
-
-
-@pytest.fixture
-def project(tmp_path: Path) -> Path:
-    target = tmp_path / "proj"
-    shutil.copytree(FIXTURE, target)
-    return target
-
-
-def make_source(project: Path) -> DbtSource:
-    return DbtSource(project / "manifest.json", project)
-
-
-def run_diff(project: Path, min_risk: str = "LOW") -> tuple[DbtSource, WritebackDiff]:
-    source = make_source(project)
-    plan = plan_writeback(trace(source.build_graph()), min_risk=min_risk)  # type: ignore[arg-type]
-    return source, diff_writeback(plan, source)
-
-
-def actions(diff: WritebackDiff) -> dict[tuple[str, str], str]:
-    return {(c.node_id, c.column): c.action for c in diff.changes}
-
-
-def regenerate_manifest(project: Path) -> None:
-    """Simulate `dbt parse`: refresh each model's column meta from the YAML files."""
-    path = project / "manifest.json"
-    manifest = json.loads(path.read_text())
-    by_name = {n["name"]: n for n in manifest["nodes"].values()}
-    for yml in (project / "models").rglob("*.yml"):
-        for entry in (yaml.safe_load(yml.read_text()) or {}).get("models", []):
-            node = by_name.get(entry["name"])
-            if node is not None:
-                node["columns"] = {
-                    c["name"]: {
-                        "name": c["name"],
-                        "meta": c.get("meta") or {},
-                        "tags": c.get("tags") or [],
-                    }
-                    for c in entry.get("columns") or []
-                }
-    path.write_text(json.dumps(manifest))
-
-
-def removed_lines(before: str, after: str) -> list[str]:
-    return [
-        line[1:]
-        for line in difflib.unified_diff(before.splitlines(), after.splitlines(), lineterm="", n=0)
-        if line.startswith("-") and not line.startswith("---")
-    ]
 
 
 # --- diff against the YAML files -----------------------------------------------------------------
@@ -130,15 +79,16 @@ def test_conflict_detail_names_the_human_tag_and_yaml_wins_over_a_stale_manifest
     conflict = next(c for c in diff.changes if c.action == "conflict")
     assert "human-placed pii tag (non-sensitive)" in conflict.detail
     markup = source.read_markup([DUMP])
-    assert markup[(DUMP, "email")] == ExistingTag(PiiTag("pii", sensitive=False), managed=False)
+    assert markup[(DUMP, "email")] == ExistingTag(sensitive=False, managed=False)
     assert markup[(DUMP, "full_name")].managed is False
 
 
 def test_read_markup_returns_provenance_of_managed_columns(project: Path) -> None:
     markup = make_source(project).read_markup([DIM])
     assert markup[(DIM, "email")] == ExistingTag(
-        PiiTag("email", sensitive=True),
+        sensitive=True,
         managed=True,
+        category="email",
         risk="LOW",
         confidence=0.1,
         origin="old.origin",
@@ -150,7 +100,7 @@ def test_unmatched_carries_a_ready_to_paste_snippet(project: Path) -> None:
     _, diff = run_diff(project)
     by_node = {c.node_id: c for c in diff.changes if c.action == "unmatched"}
     assert "no properties-file entry" in by_node[UNDOC].detail
-    assert "installed package 'vendor_pkg'" in by_node[PKG].detail
+    assert "installed package" in by_node[PKG].detail
 
     snippet = by_node[UNDOC].detail.split("add manually:\n", 1)[1]
     parsed = yaml.safe_load(snippet)
@@ -168,7 +118,7 @@ def test_model_entry_missing_from_the_file_is_unmatched(project: Path) -> None:
     _, diff = run_diff(project)
     unmatched = next(c for c in diff.changes if c.node_id == DUMP)
     assert unmatched.action == "unmatched"
-    assert "no entry for the model in schema.yml" in unmatched.detail
+    assert "no entry for the model in models/marts/schema.yml" in unmatched.detail
 
 
 @pytest.mark.parametrize("patch_path", ["demo_shop://../outside.yml", "demo_shop:///etc/hosts"])
@@ -397,7 +347,10 @@ def test_failed_atomic_replace_fails_only_that_file_and_leaves_it_intact(
     result = apply_writeback(diff, source, confirm=True)
 
     assert {c.node_id for c, _ in result.failed} == {STG}
-    assert all("cannot write schema.yml: No space left on device" in m for _, m in result.failed)
+    assert all(
+        "cannot write models/staging/schema.yml: No space left on device" in m
+        for _, m in result.failed
+    )
     assert {c.node_id for c in result.applied} == {DIM}
     assert staging.read_bytes() == original
     assert not list(staging.parent.glob(".*.tmp"))  # temp file cleaned up
@@ -427,7 +380,8 @@ def test_write_changes_for_unlocatable_nodes_reports_failure(project: Path) -> N
     change = TagChange(UNDOC, "mart_undocumented", "email", PiiTag("email"), "MEDIUM", 0.7, RAW)
     result = make_source(project).write_changes([change])
     assert result.applied == []
-    assert "cannot place" in result.failed[0][1]
+    assert result.failed == []  # nothing was attempted: a skip, not a failure
+    assert "cannot place" in result.skipped[0][1]
 
 
 def test_failed_write_in_one_file_still_converges_on_rerun(project: Path) -> None:
@@ -450,11 +404,11 @@ def test_failed_write_in_one_file_still_converges_on_rerun(project: Path) -> Non
 
 
 @pytest.mark.parametrize("min_risk", ["LOW", "MEDIUM"])
-def test_convergence_on_disk(project: Path, min_risk: str) -> None:
+def test_convergence_on_disk(project: Path, min_risk: Risk) -> None:
     regenerate_manifest(project)  # manifest and YAML agree, as after a fresh `dbt parse`
     source = make_source(project)
     before = trace(source.build_graph())
-    plan = plan_writeback(before, min_risk=min_risk)  # type: ignore[arg-type]
+    plan = plan_writeback(before, min_risk=min_risk)
     result = apply_writeback(diff_writeback(plan, source), source, confirm=True)
     assert not result.failed
     assert result.applied
@@ -466,7 +420,7 @@ def test_convergence_on_disk(project: Path, min_risk: str) -> None:
     after = trace(make_source(project).build_graph())
     assert after == before  # marked columns did not re-seed: no ORIGIN inflation
 
-    rediff = diff_writeback(plan_writeback(after, min_risk=min_risk), make_source(project))  # type: ignore[arg-type]
+    rediff = diff_writeback(plan_writeback(after, min_risk=min_risk), make_source(project))
     assert rediff.pending == []
 
     snapshot = {p: p.read_bytes() for p in (project / "models").rglob("*.yml")}
@@ -540,17 +494,38 @@ def test_declared_pii_ignores_propagated_columns_but_reads_plain_pii() -> None:
 @pytest.mark.parametrize(
     ("raw_column", "expected"),
     [
-        ({"meta": {"pii": False}}, ExistingTag(PiiTag("pii", sensitive=False), managed=False)),
-        ({"tags": ["pii:email"]}, ExistingTag(PiiTag("email"), managed=False)),
-        ({"tags": ["pii"]}, ExistingTag(PiiTag("pii"), managed=False)),
-        ({"meta": {"sensiflow": {"propagated": True}}}, ExistingTag(PiiTag("pii"), managed=True)),
+        ({"meta": {"pii": False}}, ExistingTag(sensitive=False, managed=False, not_pii=True)),
+        ({"tags": ["pii:email"]}, ExistingTag(sensitive=True, managed=False, category="email")),
+        ({"tags": ["pii"]}, ExistingTag(sensitive=True, managed=False)),
+        (
+            {"meta": {"pii": True, "pii_category": "phone", "pii_sensitive": False}},
+            ExistingTag(sensitive=False, managed=False, category="phone"),
+        ),
+        # config.meta is merged over meta, exactly as the seed reader sees it
+        (
+            {"meta": {"pii": True}, "config": {"meta": {"pii": False}}},
+            ExistingTag(sensitive=False, managed=False, not_pii=True),
+        ),
+        ({"meta": {"sensiflow": {"propagated": True}}}, ExistingTag(sensitive=True, managed=True)),
         ({"meta": {"owner": "x"}, "tags": ["internal"]}, None),
+        ("not-a-mapping", None),
     ],
 )
-def test_existing_tag_translation(raw_column: dict[str, Any], expected: ExistingTag | None) -> None:
-    from sensiflow.sources.dbt import _existing_from_column
+def test_column_parser_translation(raw_column: Any, expected: ExistingTag | None) -> None:
+    assert _parse_column(raw_column) == expected
 
-    assert _existing_from_column(raw_column) == expected
+
+def test_seed_reader_and_write_back_reader_share_one_parser() -> None:
+    # A negative declaration never seeds; a managed column never seeds; both
+    # readers see the same merged meta (ADR-0006 A5).
+    raw = {
+        "columns": {
+            "denied": {"meta": {"pii": False}},
+            "denied_via_config": {"meta": {"pii": True}, "config": {"meta": {"pii": False}}},
+            "human": {"meta": {"pii": True, "pii_category": "email"}},
+        }
+    }
+    assert _declared_pii(raw) == {"human": PiiTag("email")}
 
 
 # --- CLI -----------------------------------------------------------------------------------------
@@ -609,7 +584,7 @@ def test_cli_apply_cycle_writes_files_then_converges(
 ) -> None:
     assert main(cli(project, "--apply", "--yes")) == 0
     out = capsys.readouterr().out
-    assert "result: APPLIED — 5 applied, 0 failed" in out
+    assert "result: APPLIED — 5 applied, 0 skipped, 0 failed" in out
     assert main(cli(project, "--format", "json")) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["summary"]["add"] == 0

@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import unicodedata
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,7 +27,7 @@ from sensiflow.model import RISK_RANK, LineageGraph, Node, PiiTag, Risk
 from sensiflow.root_selectors import GraphSelection, resolve_patterns
 from sensiflow.sources._dbt_yaml import PropertiesFile
 from sensiflow.sources.base import ExistingTag
-from sensiflow.writeback import ApplyResult, TagChange
+from sensiflow.writeback import ApplyResult, TagChange, recheck_reason, reclassify_change
 
 #: resource kinds that become graph vertices; tests/macros/exposures are not data.
 _INCLUDED_KINDS = frozenset({"model", "seed", "snapshot"})
@@ -55,28 +56,61 @@ def _is_propagated(meta: dict[str, Any]) -> bool:
     return isinstance(block, dict) and block.get("propagated") is True
 
 
+def _as_risk(value: Any) -> Risk | None:
+    return next((risk for risk in RISK_RANK if risk == value), None)
+
+
+def _parse_column(column: Any) -> ExistingTag | None:
+    """What one column entry declares — the single parser behind both readers (ADR-0006 A5).
+
+    The seed reader (manifest) and the write-back reader (properties files)
+    both derive from this over the merged ``meta`` view, so they can never
+    disagree. Tool-written markup (``meta.sensiflow.propagated``) is managed;
+    ``pii: true`` and ``pii`` / ``pii:<category>`` tags are human markup;
+    ``pii: false`` is a human *negative* declaration, never a tag.
+    """
+    if not isinstance(column, dict):
+        return None
+    meta = _effective_meta(column)
+    category = meta.get("pii_category")
+    category_text = str(category) if category else None
+    if _is_propagated(meta):
+        block = meta[MARKER_KEY]
+        confidence = block.get("confidence")
+        origin = block.get("origin")
+        return ExistingTag(
+            sensitive=bool(meta.get("pii_sensitive", True)),
+            managed=True,
+            category=category_text,
+            risk=_as_risk(block.get("risk")),
+            confidence=float(confidence) if isinstance(confidence, int | float) else None,
+            origin=origin if isinstance(origin, str) else None,
+        )
+    pii = meta.get("pii")
+    if pii is False:
+        return ExistingTag(sensitive=False, managed=False, not_pii=True)
+    if pii is True:
+        return ExistingTag(
+            sensitive=bool(meta.get("pii_sensitive", True)),
+            managed=False,
+            category=category_text,
+        )
+    for tag in column.get("tags") or []:
+        if tag == "pii":
+            return ExistingTag(sensitive=True, managed=False)
+        if isinstance(tag, str) and tag.startswith("pii:") and len(tag) > 4:
+            return ExistingTag(sensitive=True, managed=False, category=tag[4:])
+    return None
+
+
 def _declared_pii(raw: dict[str, Any]) -> dict[str, PiiTag]:
-    """Columns carrying PII annotations, except tool-propagated ones (ADR-0006 §4)."""
+    """Seeds: human-declared PII columns; tool-written and negative declarations never seed."""
     declared: dict[str, PiiTag] = {}
     for column_name, column in (raw.get("columns") or {}).items():
-        if _is_propagated(_effective_meta(column)):
+        existing = _parse_column(column)
+        if existing is None or existing.managed or existing.not_pii:
             continue
-        meta = column.get("meta") or {}
-        if meta.get("pii") is True:
-            declared[column_name] = PiiTag(
-                category=str(meta.get("pii_category") or "pii"),
-                sensitive=bool(meta.get("pii_sensitive", True)),
-            )
-            continue
-        for tag in column.get("tags") or []:
-            if not isinstance(tag, str):
-                continue
-            if tag == "pii":
-                declared[column_name] = PiiTag(category="pii")
-                break
-            if tag.startswith("pii:") and len(tag) > 4:
-                declared[column_name] = PiiTag(category=tag[4:])
-                break
+        declared[column_name] = PiiTag(existing.category or "pii", existing.sensitive)
     return declared
 
 
@@ -122,72 +156,75 @@ class _Location:
     """Where a node's column markup lives: a properties file and its entry."""
 
     path: Path
+    label: str  # project-relative path: the only form that reaches messages and output
     section: str
     name: str
 
 
-def _as_risk(value: Any) -> Risk | None:
-    return next((risk for risk in RISK_RANK if risk == value), None)
+#: dbt's own configuration files are never properties files (ADR-0006 A7).
+_DENIED_FILES = frozenset({"dbt_project.yml", "profiles.yml", "packages.yml", "dependencies.yml"})
+_DENIED_DIRS = frozenset({".git", "target", "dbt_packages", "logs"})
+_UNSAFE_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp"})
 
 
-def _human_tag(column: Any, meta: dict[str, Any]) -> PiiTag | None:
-    """PII declared without the marker: ``meta.pii`` (primary) or ``pii`` / ``pii:<cat>`` tags."""
-    pii = meta.get("pii")
-    if pii is True or pii is False:
-        # An explicit human "not PII" has no PiiTag form; the closest honest
-        # reading is non-sensitive, so a sensitive derivation conflicts with it.
-        return PiiTag(
-            category=str(meta.get("pii_category") or "pii"),
-            sensitive=bool(meta.get("pii_sensitive", True)) and pii,
-        )
-    for tag in column.get("tags") or []:
-        if tag == "pii":
-            return PiiTag(category="pii")
-        if isinstance(tag, str) and tag.startswith("pii:") and len(tag) > 4:
-            return PiiTag(category=tag[4:])
+def _unsafe_text(*values: str) -> bool:
+    """True when a string has control, format (bidi) or line-break characters.
+
+    Such names cannot round-trip through YAML or be shown safely, so they are
+    never written and never put in a snippet.
+    """
+    return any(unicodedata.category(ch) in _UNSAFE_CATEGORIES for v in values for ch in v)
+
+
+def _writable_problem(relative: Path) -> str | None:
+    """Why a project-relative path may not be edited, or None when it may (A7)."""
+    if relative.suffix.lower() not in (".yml", ".yaml"):
+        return "is not a .yml/.yaml file"
+    if relative.name in _DENIED_FILES:
+        return "is a dbt configuration file"
+    if _DENIED_DIRS.intersection(relative.parts[:-1]):
+        return "is inside a generated or VCS directory"
     return None
 
 
-def _existing_from_column(column: Any) -> ExistingTag | None:
-    """One properties-file column entry in the neutral write-back shape."""
-    meta = _effective_meta(column)
-    if not _is_propagated(meta):
-        tag = _human_tag(column, meta)
-        return ExistingTag(tag=tag, managed=False) if tag is not None else None
-    block = meta[MARKER_KEY]
-    confidence = block.get("confidence")
-    origin = block.get("origin")
-    return ExistingTag(
-        tag=PiiTag(
-            category=str(meta.get("pii_category") or "pii"),
-            sensitive=bool(meta.get("pii_sensitive", True)),
-        ),
-        managed=True,
-        risk=_as_risk(block.get("risk")),
-        confidence=float(confidence) if isinstance(confidence, int | float) else None,
-        origin=origin if isinstance(origin, str) else None,
-    )
+def _yaml_snippet(section: str, model: str, change: TagChange) -> str | None:
+    """A ready-to-paste properties entry; None when a name is not safe to emit.
 
+    Every scalar goes through ``json.dumps``: a JSON string is a valid YAML
+    double-quoted scalar, so no catalog-controlled text can alter the structure.
+    """
+    texts = (model, change.column, change.tag.category, change.risk, change.origin_node)
+    if _unsafe_text(*texts):
+        return None
 
-def _yaml_snippet(section: str, model: str, change: TagChange) -> str:
-    """A ready-to-paste properties entry for a change the tool cannot place itself."""
+    def q(value: object) -> str:
+        return json.dumps(value, ensure_ascii=False)
+
     return "\n".join(
         [
             f"{section}:",
-            f"  - name: {model}",
+            f"  - name: {q(model)}",
             "    columns:",
-            f"      - name: {change.column}",
+            f"      - name: {q(change.column)}",
             "        meta:",
             "          pii: true",
-            f"          pii_category: {change.tag.category}",
-            f"          pii_sensitive: {str(change.tag.sensitive).lower()}",
+            f"          pii_category: {q(change.tag.category)}",
+            f"          pii_sensitive: {q(change.tag.sensitive)}",
             f"          {MARKER_KEY}:",
             "            propagated: true",
-            f"            risk: {change.risk}",
-            f"            confidence: {round(change.confidence, 4)}",
-            f"            origin: {change.origin_node}",
+            f"            risk: {q(change.risk)}",
+            f"            confidence: {q(round(change.confidence, 4))}",
+            f"            origin: {q(change.origin_node)}",
         ]
     )
+
+
+def _unmatched_detail(reason: str, section: str, model: str, change: TagChange) -> str:
+    snippet = _yaml_snippet(section, model, change)
+    tail = "sensiflow does not create files or model blocks"
+    if snippet is None:
+        return f"{reason}; {tail}, and no snippet is offered (a name has control characters)"
+    return f"{reason}; {tail} — add manually:\n{snippet}"
 
 
 def _apply_to_column(properties: PropertiesFile, column: Any, change: TagChange) -> None:
@@ -198,16 +235,17 @@ def _apply_to_column(properties: PropertiesFile, column: Any, change: TagChange)
     tool wrote and keeps in step with the block. New mappings are filled
     *before* they are attached, so trailing comments move onto their last leaf.
     """
+    scalar = properties.scalar
     natives: dict[str, Any] = {
         "pii": True,
-        "pii_category": change.tag.category,
+        "pii_category": scalar(change.tag.category),
         "pii_sensitive": change.tag.sensitive,
     }
     provenance: dict[str, Any] = {
         "propagated": True,
-        "risk": change.risk,
+        "risk": scalar(change.risk),
         "confidence": round(change.confidence, 4),
-        "origin": change.origin_node,
+        "origin": scalar(change.origin_node),
     }
     meta = column.get("meta")
     if not properties.is_map(meta):
@@ -226,14 +264,17 @@ def _apply_to_column(properties: PropertiesFile, column: Any, change: TagChange)
         properties.set_key(meta, MARKER_KEY, properties.new_map(**provenance))
 
 
-def _open(cache: dict[Path, PropertiesFile], path: Path) -> PropertiesFile:
+def _open(cache: dict[Path, PropertiesFile], location: _Location) -> PropertiesFile:
     """Parse each properties file once per operation."""
-    if path not in cache:
+    if location.path not in cache:
         try:
-            cache[path] = PropertiesFile.read(path)
+            cache[location.path] = PropertiesFile.read(location.path, location.label)
         except (OSError, UnicodeDecodeError) as exc:
-            raise SensiflowInputError(f"cannot read properties file {path}: {exc}") from None
-    return cache[path]
+            reason = exc.strerror if isinstance(exc, OSError) else "not valid UTF-8"
+            raise SensiflowInputError(
+                f"cannot read properties file {location.label}: {reason}"
+            ) from None
+    return cache[location.path]
 
 
 def _atomic_write(path: Path, text: str) -> None:
@@ -257,6 +298,46 @@ def _atomic_write(path: Path, text: str) -> None:
         raise
 
 
+_UNSAFE_NAME = "column or model name contains line breaks or control characters; never written"
+_DUPLICATE_COLUMNS = "duplicate column entries in the properties file; resolve manually"
+
+
+def _failure_reason(exc: Exception) -> str:
+    """A path-free reason: OSError text without its filename, else the error as raised."""
+    return exc.strerror if isinstance(exc, OSError) and exc.strerror else str(exc)
+
+
+def _columns_by_name(properties: PropertiesFile, entry: Any) -> dict[str, list[Any]]:
+    """Column entries grouped by lower-cased name; nameless entries are ignored."""
+    grouped: dict[str, list[Any]] = {}
+    for column in properties.columns(entry):
+        name = column.get("name")
+        if isinstance(name, str):
+            grouped.setdefault(name.lower(), []).append(column)
+    return grouped
+
+
+def _recheck(properties: PropertiesFile, location: _Location, change: TagChange) -> Any:
+    """Re-verify one change against the freshly read file (ADR-0006 §5, A3).
+
+    Returns the column entry to edit (``None``: it must be added) or, when the
+    write must not happen, a string with the reason.
+    """
+    if _unsafe_text(change.column, change.node_name):
+        return _UNSAFE_NAME
+    entry = properties.find_entry(location.section, location.name)
+    if entry is None:
+        return f"entry vanished from {location.label}"
+    matches = properties.columns_named(entry, change.column)
+    if len(matches) > 1:
+        return _DUPLICATE_COLUMNS
+    column = matches[0] if matches else None
+    verdict = reclassify_change(change, _parse_column(column) if column is not None else None)
+    if verdict.action not in ("add", "update"):
+        return recheck_reason(verdict)
+    return column
+
+
 class DbtSource:
     """LineageSource over a local dbt manifest.json, and WritebackTarget over its project.
 
@@ -276,24 +357,34 @@ class DbtSource:
     # -- WritebackTarget (ADR-0006 §3, §6) -------------------------------------
 
     def read_markup(self, node_ids: Sequence[str]) -> dict[tuple[str, str], ExistingTag]:
-        """Column markup as it stands in the properties files (the manifest is not consulted)."""
+        """Column markup as it stands in the properties files (the manifest is not consulted).
+
+        Duplicate column entries and nameless ones report no markup: the former
+        are surfaced as ``unmatched`` by :meth:`find_unmatched`.
+        """
         project_dir = self._require_project_dir()
         found, _ = self._locate(node_ids, project_dir)
         files: dict[Path, PropertiesFile] = {}
         markup: dict[tuple[str, str], ExistingTag] = {}
         for node_id, location in found.items():
-            properties = _open(files, location.path)
+            properties = _open(files, location)
             entry = properties.find_entry(location.section, location.name)
             if entry is None:
                 continue
-            for column in properties.columns(entry):
-                existing = _existing_from_column(column)
+            columns = _columns_by_name(properties, entry)
+            for name, matches in columns.items():
+                existing = _parse_column(matches[0]) if len(matches) == 1 else None
                 if existing is not None:
-                    markup[(node_id, str(column["name"]).lower())] = existing
+                    markup[(node_id, name)] = existing
         return markup
 
     def find_unmatched(self, changes: Sequence[TagChange]) -> dict[tuple[str, str], str]:
-        """Changes with no properties entry to edit, each with a ready-to-paste snippet."""
+        """Changes the project cannot place: physical placement only (A6).
+
+        Covers unsafe names, non-project / package / undocumented nodes (with a
+        ready-to-paste snippet where one is safe), a vanished model entry, and
+        ambiguous duplicate column entries.
+        """
         project_dir = self._require_project_dir()
         node_ids = list(dict.fromkeys(c.node_id for c in changes))
         found, reasons = self._locate(node_ids, project_dir)
@@ -301,38 +392,43 @@ class DbtSource:
         unmatched: dict[tuple[str, str], str] = {}
         for change in changes:
             key = (change.node_id, change.column.lower())
+            if _unsafe_text(change.column, change.node_name):
+                unmatched[key] = _UNSAFE_NAME
+                continue
             location = found.get(change.node_id)
             if location is None:
                 reason, section = reasons[change.node_id]
-            else:
-                properties = _open(files, location.path)
-                if properties.find_entry(location.section, location.name) is not None:
-                    continue
-                reason = f"no entry for the model in {location.path.name}"
-                section = location.section
-            unmatched[key] = (
-                f"{reason}; sensiflow does not create files or model blocks — "
-                f"add manually:\n{_yaml_snippet(section, change.node_name, change)}"
-            )
+                unmatched[key] = _unmatched_detail(reason, section, change.node_name, change)
+                continue
+            properties = _open(files, location)
+            entry = properties.find_entry(location.section, location.name)
+            if entry is None:
+                reason = f"no entry for the model in {location.label}"
+                unmatched[key] = _unmatched_detail(
+                    reason, location.section, change.node_name, change
+                )
+            elif len(properties.columns_named(entry, change.column)) > 1:
+                unmatched[key] = _DUPLICATE_COLUMNS
         return unmatched
 
     def write_changes(self, changes: Sequence[TagChange]) -> ApplyResult:
         """Patch the properties files in place; one atomic write per file.
 
-        A file that cannot be read, parsed or replaced fails only its own
-        changes. Changes whose entry vanished since the diff are skipped and
-        reported in ``failed`` with a ``skipped:`` message.
+        Each change is re-classified against the freshly read column before
+        anything is edited (the same check the OpenMetadata path does against
+        the re-fetched table): reclassified changes are *skipped* with the
+        reason. A file that cannot be read, parsed or replaced *fails* only its
+        own changes (A3).
         """
         project_dir = self._require_project_dir()
-        found, reasons = self._locate(
-            list(dict.fromkeys(c.node_id for c in changes)), project_dir
-        )
+        found, reasons = self._locate(list(dict.fromkeys(c.node_id for c in changes)), project_dir)
         result = ApplyResult(applied=[], failed=[])
         by_file: dict[Path, list[tuple[TagChange, _Location]]] = {}
         for change in changes:
             location = found.get(change.node_id)
             if location is None:
-                result.failed.append((change, f"cannot place: {reasons[change.node_id][0]}"))
+                reason = reasons[change.node_id][0]
+                result.skipped.append((change, f"skipped: cannot place: {reason}"))
             else:
                 by_file.setdefault(location.path, []).append((change, location))
         for path, items in by_file.items():
@@ -343,34 +439,34 @@ class DbtSource:
     def _write_file(
         path: Path, items: list[tuple[TagChange, _Location]], result: ApplyResult
     ) -> None:
-        applied: list[TagChange] = []
-        skipped: list[tuple[TagChange, str]] = []
+        label = items[0][1].label
         try:
-            properties = PropertiesFile.read(path)
-            for change, location in items:
-                entry = properties.find_entry(location.section, location.name)
-                if entry is None:
-                    skipped.append((change, f"skipped: entry vanished from {path.name}"))
-                    continue
-                column = properties.find_column(entry, change.column)
-                if column is None:
-                    column = properties.add_column(entry, change.column)
-                _apply_to_column(properties, column, change)
-                applied.append(change)
-            if applied:
-                _atomic_write(path, properties.render())
-        except (OSError, SensiflowInputError) as exc:
-            reason = exc.strerror if isinstance(exc, OSError) and exc.strerror else str(exc)
-            skipped_changes = {id(c) for c, _ in skipped}
-            result.failed.extend(skipped)
-            result.failed.extend(
-                (c, f"cannot write {path.name}: {reason}")
-                for c, _ in items
-                if id(c) not in skipped_changes
-            )
+            properties = PropertiesFile.read(path, label)
+        except (OSError, SensiflowInputError, ValueError) as exc:
+            reason = _failure_reason(exc)
+            result.failed.extend((c, f"cannot read {label}: {reason}") for c, _ in items)
             return
-        result.failed.extend(skipped)
-        result.applied.extend(applied)
+        edits: list[TagChange] = []
+        for change, location in items:
+            problem = _recheck(properties, location, change)
+            if isinstance(problem, str):
+                result.skipped.append((change, f"skipped: {problem}"))
+                continue
+            column = problem
+            if column is None:
+                entry = properties.find_entry(location.section, location.name)
+                column = properties.add_column(entry, change.column)
+            _apply_to_column(properties, column, change)
+            edits.append(change)
+        if not edits:
+            return
+        try:
+            _atomic_write(path, properties.render())
+        except (OSError, SensiflowInputError, ValueError) as exc:
+            reason = _failure_reason(exc)
+            result.failed.extend((c, f"cannot write {label}: {reason}") for c in edits)
+            return
+        result.applied.extend(edits)
 
     def _require_project_dir(self) -> Path:
         if self._project_dir is None:
@@ -388,8 +484,9 @@ class DbtSource:
         """Resolve nodes to their properties files via the manifest's ``patch_path``.
 
         Returns ``(located, {node_id: (reason, section)})`` for the nodes that
-        cannot be placed: sources, installed-package nodes, and models without
-        a properties entry or whose file is missing or outside the project.
+        cannot be placed: sources, installed-package nodes, models without a
+        properties entry, and files that are missing, outside the project, or
+        not an editable properties file (ADR-0006 A7).
         """
         manifest = self._load()
         nodes = manifest.get("nodes") or {}
@@ -406,8 +503,7 @@ class DbtSource:
             name = raw.get("name") or node_id.rsplit(".", 1)[-1]
             if raw.get("package_name") != project_name:
                 reasons[node_id] = (
-                    f"belongs to installed package {raw.get('package_name')!r}, not the root "
-                    "project",
+                    "belongs to an installed package, not the root project",
                     section,
                 )
                 continue
@@ -423,10 +519,15 @@ class DbtSource:
             resolved = (root / (tail if sep else patch_path)).resolve()
             if not resolved.is_relative_to(root):
                 reasons[node_id] = ("patch_path points outside the project directory", section)
+                continue
+            relative = resolved.relative_to(root)
+            problem = _writable_problem(relative)
+            if problem is not None:
+                reasons[node_id] = (f"patch_path {problem}, so sensiflow will not edit it", section)
             elif not resolved.is_file():
-                reasons[node_id] = (f"properties file {patch_path} not found on disk", section)
+                reasons[node_id] = ("the properties file is not on disk", section)
             else:
-                found[node_id] = _Location(path=resolved, section=section, name=name)
+                found[node_id] = _Location(resolved, relative.as_posix(), section, name)
         return found, reasons
 
     @staticmethod
@@ -436,7 +537,10 @@ class DbtSource:
             return name
         project_file = root / "dbt_project.yml"
         if project_file.is_file():
-            declared = PropertiesFile.read(project_file).document
+            try:
+                declared = PropertiesFile.read(project_file, "dbt_project.yml").document
+            except (OSError, ValueError):
+                declared = None
             if isinstance(declared, dict) and isinstance(declared.get("name"), str):
                 return str(declared["name"])
         raise SensiflowInputError(
@@ -460,9 +564,7 @@ class DbtSource:
     def _resolve_selection(selection: GraphSelection, graph: LineageGraph) -> list[str]:
         """Resolve the selection to node ids, in memory (ADR-0002 amendment A5)."""
         if selection.from_seeds:
-            seeded = sorted(
-                node_id for node_id, node in graph.nodes.items() if node.declared_pii
-            )
+            seeded = sorted(node_id for node_id, node in graph.nodes.items() if node.declared_pii)
             if not seeded:
                 raise SensiflowInputError(
                     "--roots-from-seeds found no PII-seeded models or sources in the "
@@ -484,9 +586,7 @@ class DbtSource:
         except FileNotFoundError:
             raise SensiflowInputError(f"dbt manifest not found: {self._path}") from None
         except UnicodeDecodeError:
-            raise SensiflowInputError(
-                f"dbt manifest {self._path}: not valid UTF-8"
-            ) from None
+            raise SensiflowInputError(f"dbt manifest {self._path}: not valid UTF-8") from None
         except OSError as exc:
             raise SensiflowInputError(
                 f"cannot read dbt manifest {self._path}: {exc.strerror}"
@@ -501,8 +601,7 @@ class DbtSource:
             "nodes" not in manifest and "sources" not in manifest
         ):
             raise SensiflowInputError(
-                f"{self._path} has neither 'nodes' nor 'sources' — "
-                "not a dbt manifest.json"
+                f"{self._path} has neither 'nodes' nor 'sources' — not a dbt manifest.json"
             )
         return manifest
 
@@ -525,17 +624,13 @@ class DbtSource:
         """A root is a unique_id, or a bare model/source name if unambiguous."""
         if root in graph.nodes:
             return root
-        matches = sorted(
-            node_id for node_id, node in graph.nodes.items() if node.name == root
-        )
+        matches = sorted(node_id for node_id, node in graph.nodes.items() if node.name == root)
         if len(matches) == 1:
             return matches[0]
         if not matches:
             raise SensiflowInputError(
-                f"unknown root {root!r}: not a unique_id or a model/source name "
-                "in the manifest"
+                f"unknown root {root!r}: not a unique_id or a model/source name in the manifest"
             )
         raise SensiflowInputError(
-            f"ambiguous root {root!r}: matches {', '.join(matches)} — "
-            "use the full unique_id"
+            f"ambiguous root {root!r}: matches {', '.join(matches)} — use the full unique_id"
         )
