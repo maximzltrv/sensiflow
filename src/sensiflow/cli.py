@@ -11,7 +11,7 @@ from collections.abc import Callable
 from enum import IntEnum
 
 from sensiflow.engine import trace
-from sensiflow.exceptions import SensiflowError, SensiflowInputError
+from sensiflow.exceptions import SensiflowDependencyError, SensiflowError, SensiflowInputError
 from sensiflow.gate import evaluate_gate
 from sensiflow.model import TraceResult
 from sensiflow.report import render_check_json, render_check_text, render_json, render_text
@@ -155,6 +155,18 @@ def _build_parser() -> argparse.ArgumentParser:
         default="text",
         help="output format (default: text)",
     )
+
+    serve = subparsers.add_parser(
+        "serve",
+        help="run the HTTP API server (needs the [server] extra)",
+        epilog=_EXIT_CODE_EPILOG,
+    )
+    serve.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="interface to bind (default: 127.0.0.1; containers pass 0.0.0.0)",
+    )
+    serve.add_argument("--port", type=int, default=8000, help="port to listen on (default: 8000)")
     return parser
 
 
@@ -271,9 +283,29 @@ def _run_check(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
     return _guarded(compute)
 
 
+def _run_serve(args: argparse.Namespace) -> int:
+    def compute() -> tuple[str, ExitCode]:
+        # Imported only on demand: the base install has no fastapi/uvicorn.
+        try:
+            import uvicorn
+
+            from sensiflow.server import create_app
+        except ImportError as exc:
+            raise SensiflowDependencyError(
+                "the HTTP server needs the server extra: pip install 'sensiflow[server]'"
+            ) from exc
+        uvicorn.run(create_app(), host=args.host, port=args.port)
+        return "", ExitCode.OK
+
+    return _guarded(compute)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+
+    if args.command == "serve":
+        return _run_serve(args)
 
     if args.roots_files and len(args.roots_files) > 1:
         # argparse would silently keep the last occurrence; reject instead.
