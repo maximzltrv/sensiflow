@@ -6,7 +6,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
-from sensiflow.model import LineageGraph, PiiTag, Risk
+from sensiflow.model import LineageGraph, Risk
 from sensiflow.root_selectors import GraphSelection
 
 if TYPE_CHECKING:
@@ -35,19 +35,21 @@ class LineageSource(Protocol):
 class ExistingTag:
     """PII markup currently on a column, in the neutral shape the diff reasons about.
 
-    ``managed`` is True iff the sensiflow marker is present. ``risk`` /
-    ``confidence`` / ``origin`` carry the provenance a target can store (dbt);
-    targets that cannot (OpenMetadata) leave them ``None`` and the diff then
-    compares sensitivity only.
+    ``sensitive`` and ``managed`` are always known; ``managed`` is True iff the
+    tool owns the markup (OpenMetadata: marker plus an unconfirmed Automated
+    label; dbt: the ``meta.sensiflow`` block). Every other field is ``None``
+    when the target cannot store it, and a ``None`` never participates in
+    drift. ``not_pii`` is an explicit human negative declaration ("this column
+    is not PII"), which is not the same thing as non-sensitive PII.
     """
 
-    tag: PiiTag
+    sensitive: bool
     managed: bool
+    category: str | None = None
     risk: Risk | None = None
     confidence: float | None = None
     origin: str | None = None
-
-
+    not_pii: bool = False
 @runtime_checkable
 class WritebackTarget(Protocol):
     """A catalog or project that derived markup can be written to (ADR-0006 §3).

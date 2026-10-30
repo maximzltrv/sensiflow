@@ -91,8 +91,9 @@ class MockSource:
                 result.failed.append((change, "simulated write failure"))
                 continue
             self._markup[key] = ExistingTag(
-                tag=change.tag,
+                sensitive=change.tag.sensitive,
                 managed=True,
+                category=change.tag.category,
                 risk=change.risk,
                 confidence=change.confidence,
                 origin=change.origin_node,
@@ -170,6 +171,8 @@ class MockSource:
         ]
         graph_nodes = {node.id: node for node in nodes}
         for (node_id, column), existing in self._markup.items():
-            if not existing.managed and node_id in graph_nodes:
-                graph_nodes[node_id].declared_pii[column] = existing.tag
+            if not existing.managed and not existing.not_pii and node_id in graph_nodes:
+                graph_nodes[node_id].declared_pii[column] = PiiTag(
+                    existing.category or "pii", existing.sensitive
+                )
         return LineageGraph(nodes=graph_nodes)
