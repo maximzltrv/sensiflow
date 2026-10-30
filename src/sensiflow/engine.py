@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from sqlglot.dialects.dialect import Dialect
+
 from sensiflow.exceptions import SensiflowInputError
 from sensiflow.model import Finding, LineageGraph, NodeResult, PiiTag, TraceResult
 from sensiflow.sql_analysis import analyze_sql
@@ -64,13 +66,26 @@ def _topological_order(graph: LineageGraph) -> list[str]:
     return order
 
 
+def _require_known_dialect(dialect: str) -> None:
+    try:
+        Dialect.get_or_raise(dialect)
+    except ValueError as exc:
+        raise SensiflowInputError(f"unknown SQL dialect {dialect!r}: {exc}") from None
+
+
 def trace(
     graph: LineageGraph,
     *,
     dialect: str = "bigquery",
     generic_columns: set[str] | None = None,
 ) -> TraceResult:
-    """Propagate declared PII down the graph and classify every node."""
+    """Propagate declared PII down the graph and classify every node.
+
+    An unknown ``dialect`` raises :class:`SensiflowInputError` up front: parsing
+    would otherwise degrade silently to presence-based classification, which
+    weakens a gate without telling anyone.
+    """
+    _require_known_dialect(dialect)
     generic = frozenset(generic_columns) if generic_columns is not None else DEFAULT_GENERIC_COLUMNS
     outputs: dict[str, dict[str, _Propagated]] = {}
     results: dict[str, NodeResult] = {}

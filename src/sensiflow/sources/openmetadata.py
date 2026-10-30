@@ -12,11 +12,12 @@ anything else that can reach logs or reports.
 from __future__ import annotations
 
 import importlib
+import logging
 from collections import deque
 from collections.abc import Callable
 from types import ModuleType
-from typing import TYPE_CHECKING, Any
-from urllib.parse import urlsplit
+from typing import TYPE_CHECKING, Any, TypeGuard
+from urllib.parse import quote, urlsplit
 
 from sensiflow.exceptions import (
     SensiflowConnectionError,
@@ -28,6 +29,8 @@ from sensiflow.root_selectors import GraphSelection, resolve_patterns
 
 if TYPE_CHECKING:
     import httpx
+
+logger = logging.getLogger(__name__)
 
 _TABLE_FIELDS = "columns,tags,owners"
 _PAGE_LIMIT = 100
@@ -83,6 +86,42 @@ def _node_from_table(table: dict[str, Any], upstream: list[str]) -> Node:
         sql=sql,
         declared_pii=_declared_pii(table),
     )
+
+
+def _fqn_problem(fqn: str) -> str | None:
+    """Why ``fqn`` cannot be spliced into a request path, or None when it is safe.
+
+    FQNs travel as a single path segment, so anything that would change the
+    URL's structure (separators, query/fragment markers, escape sequences,
+    dot-segments) or smuggle control characters is refused outright.
+    """
+    if not fqn:
+        return "it is empty"
+    for ch in fqn:
+        if ch in "/\\?#%;" or ord(ch) < 0x20 or ord(ch) == 0x7F:
+            return "it contains a character that is not allowed in a table name"
+    if fqn == "." or ".." in fqn:
+        return "it contains a dot-segment"
+    return None
+
+
+def _validate_fqn(fqn: str) -> str:
+    """Return ``fqn`` unchanged or raise SensiflowInputError (never echoes control chars)."""
+    problem = _fqn_problem(fqn)
+    if problem is not None:
+        raise SensiflowInputError(f"invalid table name {fqn!r}: {problem}")
+    return fqn
+
+
+def _usable_fqn(fqn: object) -> TypeGuard[str]:
+    """Catalog-returned FQNs are untrusted: unsafe ones are skipped, not fatal."""
+    if not isinstance(fqn, str):
+        return False
+    problem = _fqn_problem(fqn)
+    if problem is not None:
+        logger.debug("skipping catalog entry with an unusable table name (%s)", problem)
+        return False
+    return True
 
 
 def _has_userinfo(host: str) -> bool:
@@ -159,20 +198,23 @@ class OpenMetadataSource:
         if selection.from_seeds:
             tables = self._list_tables(client, fields="columns,tags")
             seeded = sorted(
-                table["fullyQualifiedName"] for table in tables if _declared_pii(table)
+                table["fullyQualifiedName"]
+                for table in tables
+                if _declared_pii(table) and _usable_fqn(table["fullyQualifiedName"])
             )
             if not seeded:
                 raise SensiflowInputError(
-                    f"--roots-from-seeds found no PII-tagged tables at {self.host}; "
+                    "--roots-from-seeds found no PII-tagged tables in the catalog; "
                     "sensiflow needs declared PII markup to trace from "
                     "(ADR-0001 applicability precondition)"
                 )
             return seeded
-        resolved = list(selection.roots)
+        resolved = [_validate_fqn(root) for root in selection.roots]
         if selection.patterns:
             candidates = [
                 (table["fullyQualifiedName"], table.get("name") or "")
                 for table in self._list_tables(client, fields=None)
+                if _usable_fqn(table["fullyQualifiedName"])
             ]
             resolved.extend(resolve_patterns(selection.patterns, candidates))
         # One node matched by several selectors appears once (A2).
@@ -250,6 +292,8 @@ class OpenMetadataSource:
         nodes: dict[str, Node] = {}
         for table in tables:
             fqn = table["fullyQualifiedName"]
+            if not _usable_fqn(fqn):
+                continue
             upstream = list(self._edges(client, fqn, cache)[_UP])
             node = _node_from_table(table, upstream)
             nodes[node.id] = node
@@ -286,7 +330,7 @@ class OpenMetadataSource:
         return tables
 
     def _fetch_table(self, client: httpx.Client, fqn: str) -> dict[str, Any]:
-        return self._get(client, f"/tables/name/{fqn}", {"fields": _TABLE_FIELDS})
+        return self._get(client, f"/tables/name/{quote(fqn, safe='')}", {"fields": _TABLE_FIELDS})
 
     def _edges(
         self, client: httpx.Client, fqn: str, cache: _EdgeCache
@@ -295,7 +339,7 @@ class OpenMetadataSource:
             return cache[fqn]
         payload = self._get(
             client,
-            f"/lineage/table/name/{fqn}",
+            f"/lineage/table/name/{quote(fqn, safe='')}",
             {"upstreamDepth": 1, "downstreamDepth": 1},
         )
         entity = payload.get("entity") or {}
@@ -314,7 +358,10 @@ class OpenMetadataSource:
             for edge in payload.get("downstreamEdges") or []
             if edge.get("fromEntity") == entity_id
         ]
-        cache[fqn] = ([u for u in ups if u], [d for d in downs if d])
+        cache[fqn] = (
+            [u for u in ups if _usable_fqn(u)],
+            [d for d in downs if _usable_fqn(d)],
+        )
         return cache[fqn]
 
     # -- transport with error mapping (ADR-0002 §5) --------------------------
@@ -331,6 +378,8 @@ class OpenMetadataSource:
             raise SensiflowConnectionError(
                 f"cannot reach OpenMetadata at {self.host}: {type(exc).__name__}"
             ) from None
+        except httpx_mod.InvalidURL:
+            raise SensiflowInputError("a table name produced an invalid request URL") from None
         if response.status_code == 401:
             raise SensiflowConnectionError(
                 f"authentication failed (401) at {self.host} — check the JWT token"

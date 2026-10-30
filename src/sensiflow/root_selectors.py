@@ -27,6 +27,11 @@ _GLOB_CHARS = ("*", "?", "[")
 _MAX_ROOTS_FILE_BYTES = 1024 * 1024
 
 
+def has_control_chars(value: str) -> bool:
+    """True when ``value`` contains an ASCII control character (C0 or DEL)."""
+    return any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value)
+
+
 def has_glob_chars(value: str) -> bool:
     """True when ``value`` contains an fnmatch metacharacter (``*``, ``?``, ``[``)."""
     return any(ch in value for ch in _GLOB_CHARS)
@@ -57,6 +62,8 @@ class GraphSelection:
         for root in self.roots:
             if not root:
                 raise SensiflowInputError("root ids must be non-empty strings")
+            if has_control_chars(root):
+                raise SensiflowInputError(f"root {root!r} contains control characters")
             if has_glob_chars(root):
                 raise SensiflowInputError(
                     f"root {root!r} contains glob characters (*, ?, [) — use patterns"
@@ -64,6 +71,8 @@ class GraphSelection:
         for pattern in self.patterns:
             if not pattern:
                 raise SensiflowInputError("root patterns must be non-empty strings")
+            if has_control_chars(pattern):
+                raise SensiflowInputError(f"pattern {pattern!r} contains control characters")
             if not has_glob_chars(pattern):
                 raise SensiflowInputError(
                     f"pattern {pattern!r} has no glob characters (*, ?, [) — use roots"

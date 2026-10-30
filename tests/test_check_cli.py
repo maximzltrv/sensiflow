@@ -251,3 +251,15 @@ def test_check_unexpected_crash_exits_3_with_traceback(
     assert "Traceback (most recent call last)" in captured.err
     assert "synthetic internal failure" in captured.err
     assert captured.out == ""
+
+
+def test_unknown_dialect_is_exit_2(capsys: pytest.CaptureFixture[str]) -> None:
+    code = main(["check", "--fail-on", "HIGH", "--dialect", "not-a-dialect"])
+    assert code == ExitCode.INPUT_ERROR
+    assert "unknown SQL dialect" in capsys.readouterr().err
+
+
+def test_control_character_root_is_exit_2(capsys: pytest.CaptureFixture[str]) -> None:
+    code = main(["check", "--fail-on", "HIGH", "--root", "raw_customers\n"])
+    assert code == ExitCode.INPUT_ERROR
+    assert "control characters" in capsys.readouterr().err

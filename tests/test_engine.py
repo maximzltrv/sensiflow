@@ -172,3 +172,28 @@ def test_by_risk_filters_and_orders() -> None:
         "dim_customers",
         "mart_customer_dump",
     }
+
+
+# --- dialect validation (ADR-0005 amendment 6) -------------------------------
+
+
+@pytest.mark.parametrize("dialect", ["nope", "BigQuery", "postgress"])
+def test_unknown_dialect_is_an_input_error(dialect: str) -> None:
+    with pytest.raises(SensiflowInputError, match="unknown SQL dialect"):
+        trace(MockSource().build_graph(), dialect=dialect)
+
+
+@pytest.mark.parametrize(
+    "dialect", ["bigquery", "postgres", "postgres, normalization_strategy=lowercase"]
+)
+def test_known_dialects_are_accepted(dialect: str) -> None:
+    assert trace(MockSource().build_graph(), dialect=dialect).nodes
+
+
+def test_unknown_dialect_no_longer_silently_untrips_the_gate() -> None:
+    # Parsing BigQuery-specific SQL under a bogus dialect used to degrade the HIGH
+    # JOIN finding to LOW without a word; it must now fail loudly instead.
+    graph = MockSource().build_graph()
+    assert trace(graph).nodes["mart_orders_enriched"].max_risk == "HIGH"
+    with pytest.raises(SensiflowInputError):
+        trace(graph, dialect="not-a-dialect")
