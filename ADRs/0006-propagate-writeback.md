@@ -1,7 +1,8 @@
 # ADR-0006: `propagate` — explicit write-back of derived PII markup
 
 - **Status:** Accepted (2026-10-30, after review; all seven open questions
-  resolved as recommended — see Review resolutions)
+  resolved as recommended — see Review resolutions). Amended 2026-10-30
+  (A1–A7, post-implementation review).
 - **Date:** 2026-10-30
 - **Deciders:** Maksim Zolotarev
 
@@ -664,3 +665,221 @@ recommendation was confirmed as drafted.
    is explicit — human-placed markup is never overwritten (conflicts are
    flagged and skipped, compatible manual markup is left untouched); only
    marker-bearing, tool-managed tags may be updated by the tool (§7).
+
+## Amendments (2026-10-30, post-implementation review)
+
+The implementation review (independent code review, test review, and a
+security assessment of the write paths) surfaced points where the accepted
+design was ambiguous, incomplete, or — in one case — unsafe as specified.
+The rulings below amend the sections they name. They change no accepted
+principle; they sharpen how the principles apply.
+
+### A1 — OpenMetadata "managed" requires the marker *and* an unconfirmed Automated label (§4, §7)
+
+The marker alone is an insufficient ownership signal on OpenMetadata, in
+both directions:
+
+1. A steward can confirm the tool's `Suggested` PII label in the catalog UI.
+   The label's state becomes `Confirmed` — a human ratification — but the
+   companion marker tag remains. A later run treating marker-only as
+   "managed" could then rewrite a decision a human has ratified.
+2. Anyone with tag-edit rights can place `Sensiflow.Propagated` next to a
+   hand-placed PII label, making the tool treat human markup as its own and
+   "update" it.
+
+**Ruling:** on OpenMetadata, a column's PII markup is *managed* iff all
+three hold: the `Sensiflow.Propagated` marker is present, **and** the
+native PII label itself carries `labelType=Automated` **and**
+`state=Suggested`. Any other combination is human markup for diff purposes
+(`manual`/`conflict` — never updated). Confirmation in the catalog is a
+human act and immediately moves the label out of the tool's authority.
+Consequences for the write path: `replace` operations must target the
+specific Automated+Suggested PII label (never positionally the first
+`PII.*` label on the column, which may be a human's), and the pre-patch
+live re-check applies the same three-part test.
+
+*How one OpenMetadata column's existing markup is classified for the diff:*
+
+```mermaid
+flowchart TD
+    L["column carries a PII.* label"] --> M{"Sensiflow.Propagated marker present?"}
+    M -- no --> H["human markup — manual / conflict, never updated"]
+    M -- yes --> S{"PII label labelType=Automated AND state=Suggested?"}
+    S -- no --> H2["human-ratified or foreign label — treated as human markup"]
+    S -- yes --> T["managed — unchanged / update per §7"]
+```
+
+Seeding exclusion is deliberately unchanged (marker-only, §4): a confirmed
+label still does not seed until the marker is removed — confirmation
+ratifies the tag, marker removal adopts it as a declaration; these remain
+two distinct human acts. dbt has no label-state concept; its managed
+signal remains the `meta.sensiflow` block, whose edits are reviewed in the
+project's own version control. The state-model asymmetry between the two
+targets is accepted and documented.
+
+Alternative considered: keep marker-only and document the confirmation
+caveat — rejected; "the tool may silently revert a human-ratified
+decision" is exactly what Context force 5 forbids.
+
+### A2 — the tool never reduces protection on its own (§7)
+
+A managed sensitivity **downgrade** — existing markup sensitive, current
+derivation non-sensitive — is not applied as an `update`. It classifies
+`conflict`, with a detail stating that the downgrade is withheld and needs
+a human. Upgrades (non-sensitive → sensitive) and provenance-only drift
+(category/risk/confidence/origin) remain `update`.
+
+Rationale: the same blast-radius asymmetry that keeps removal out of v1
+(§7). A wrong add is one noisy suggested tag; a wrong downgrade silently
+weakens markup that downstream consumers (masking policies, governance
+dashboards) may act on. Protection-reducing mutations — downgrades and
+removals alike — belong with the future `--prune` safety design, as one
+principle: *v1 never reduces protection automatically.*
+
+`conflict` is accordingly defined as "a contradiction only a human may
+resolve; nothing written" — it covers both human-vs-tool contradictions
+and withheld downgrades. Alternatives considered: applying the downgrade
+(symmetric and convergent, but protection-reducing — rejected); a new
+action value for withheld downgrades (rejected — grows the public action
+vocabulary for a case whose operational meaning `conflict` already has;
+the detail string disambiguates).
+
+### A3 — `ApplyResult` gains `skipped`; exit 3 means a real write failure (§2, §9)
+
+The accepted text routed apply-time skips (the live re-check reclassified
+a change: tag already present, human markup appeared, column or entry or
+table vanished) into `ApplyResult.failed`, so a fully benign apply could
+exit 3. Ruling:
+
+- `ApplyResult` becomes `applied` / `failed` / **`skipped`** (change +
+  reason). *Skipped* = the pre-write re-check reclassified the change;
+  nothing was attempted, nothing is broken, and a re-run's diff reports it
+  under its proper action. *Failed* = an attempted write failed (I/O,
+  HTTP, parse) — the partial-state case the exit code must not hide.
+- Exit code: `3` iff `failed` is non-empty. An apply whose only non-applied
+  entries are skips exits `0` — a skip is the apply-time analogue of a
+  non-pending diff classification, which also exits 0.
+- JSON: the `applied` block gains an additive `skipped` array (same shape
+  as `failed`). Text: a dedicated skipped section, and the final verdict
+  line reports all three counts honestly — it must not read "APPLIED" when
+  `failed` is non-empty.
+- The §5 pre-write re-check principle is target-independent: the dbt write
+  path re-verifies each column against the freshly read properties file
+  (human markup appeared → skip) exactly as the OMD path re-verifies
+  against the re-fetched table.
+
+### A4 — `stale` is plan-relative, and is explicitly not the `--prune` predicate (§2, §7)
+
+The accepted text carried two definitions of `stale`: "no current finding
+supports it" (§2) and "no supporting planned change" (§7). They diverge
+for managed markup whose finding exists but falls below this run's
+`--min-risk`/`--min-confidence`.
+
+**Ruling: the plan-relative definition (§7) is the definition.** `stale` =
+managed markup on a traced node with no supporting planned change *in this
+run*. The reported detail must be honest about why: either "no current
+finding at all" or "supported only by a finding below this run's
+thresholds" (with that finding's risk and confidence shown) — the plan
+therefore carries a summary of traced findings that were not planned, so
+the diff can tell the two cases apart.
+
+Stated consequence for the follow-up: a future `--prune` must **not** use
+plan-relative `stale` as its removal predicate — a narrowed `--min-risk`,
+`--min-confidence`, or `--root` scope would mass-delete valid markup.
+Prune needs its own threshold-independent, full-graph definition
+(reaffirming §7's reservation).
+
+### A5 — drift compares everything the target stores; "not PII" is not "non-sensitive PII" (§3, §7)
+
+Three related corrections to the diff's input shape:
+
+1. The §7 `update` row omitted `category`. Amended: managed markup is
+   `update` when **any stored field** differs — sensitivity, and, where the
+   target can store them, category, risk, confidence, origin. dbt stores
+   all of these; OpenMetadata labels store only sensitivity, so only
+   sensitivity is compared there.
+2. A human `pii: false` in dbt is a **negative declaration** ("this column
+   is not PII"), not a non-sensitive PII tag. Collapsing the two made the
+   tool read agreement (`manual`) where there is contradiction: a derived
+   non-sensitive tag against an explicit human "not PII" is a `conflict`.
+   `ExistingTag` must represent the negative declaration explicitly; any
+   planned change against it classifies `conflict`.
+3. One parser per connector: the seed reader and the write-back reader
+   derive from a single per-column parse over the merged meta view (column
+   `meta` merged with `config.meta`), so the two sides can never disagree
+   about what a column declares.
+
+`ExistingTag` is reshaped accordingly before this slice merges (it has
+never shipped): sensitivity and `managed` stay mandatory; category, risk,
+confidence, origin are `None`-able ("the target cannot store this"); the
+negative declaration is an explicit flag. Fields a target cannot store
+never participate in drift.
+
+### A6 — `find_unmatched` is the protocol's third method; non-output findings never become column writes (§3, §7)
+
+The implementation added a third read-only method to `WritebackTarget`:
+
+```python
+def find_unmatched(self, changes: Sequence[TagChange]) -> dict[tuple[str, str], str]:
+    """Planned changes the target cannot physically place, with reasons."""
+```
+
+**Blessed**, with its contract narrowed: `read_markup` lists only columns
+that *have* markup and cannot distinguish "no markup" from "no such
+column"; the diff needs that distinction, and it is target-physical
+knowledge (missing properties entry, vanished table or column,
+package-owned node). `find_unmatched` answers physical placement only —
+never policy.
+
+The policy half of the JOIN-only question moves into core: a finding whose
+column is **not part of the node's output** (used only in `JOIN`/`WHERE` —
+the engine knows this; such columns do not propagate) is pre-classified
+`unmatched` by `diff_writeback` itself, before any target is consulted.
+`Finding` gains `in_output: bool = True` (additive, carried through
+`TagChange`). Writing a column tag asserts "this column holds PII"; a
+non-output finding asserts "this node *used* PII", which is not the same
+statement — on any target.
+
+This closes a real dbt failure mode: dbt's properties YAML (and the
+manifest) list only *documented* columns, so the dbt target structurally
+cannot tell an undocumented real column (a legitimate add — documenting it
+is the point of write-back) from a column that does not exist; only the
+engine can. Without the core rule, a JOIN-only finding became a phantom
+column entry in `schema.yml`, which breaks `dbt build` on
+contract-enforced models. No paste-snippet is offered for core-unmatched
+findings — the snippet would invite pasting a phantom column.
+
+Alternatives considered: per-column schema checks in every target (OMD
+can; dbt structurally cannot — rejected); detecting JOIN-only findings in
+core by matching the `reason` display string (fragile coupling to
+presentation text — rejected).
+
+### A7 — hostile identifiers: catalog- and project-controlled strings are untrusted input (§5, §6, §9)
+
+Write-back turns catalog content into URLs, YAML, and an approval document
+a human reads before consenting. All of it is untrusted input; the
+following are contractual, not incidental:
+
+- **OpenMetadata URLs**: FQNs are validated (reject path/query/fragment
+  metacharacters, raw `%`, `;`, control characters, and `..` segments) and
+  percent-encoded in every `/name/{fqn}` URL; a fetched entity is accepted
+  only if its `fullyQualifiedName` equals the requested FQN (otherwise the
+  change is skipped — never patch an entity other than the one named in
+  the reviewed plan); table ids must parse as UUIDs before use in a PATCH
+  URL.
+- **Concurrent modification**: PATCH documents carry RFC 6902 `test`
+  operations pinning the column name (and, on `replace`, the tag at the
+  target slot), plus `If-Match` with the re-fetch's ETag; a 412 or failed
+  test skips that table's changes ("modified concurrently; re-run").
+- **Rendered output**: every catalog-derived field in every text renderer
+  is escaped for control, C1, and bidirectional-override sequences — the
+  dry-run document is what the human approves; it must not be spoofable.
+  (JSON output is structurally safe already.)
+- **dbt file writes** are restricted to `.yml`/`.yaml` properties files
+  inside the project directory, excluding dbt's own configuration files
+  (`dbt_project.yml`, `profiles.yml`, `packages.yml`, `dependencies.yml`)
+  and generated directories (`target/`, `dbt_packages/`, `logs/`, `.git/`).
+  Column names containing line breaks or control characters are never
+  written (`unmatched`/skip): they cannot round-trip safely. YAML snippets
+  are emitted via a YAML serializer, never string interpolation.
+- `ruamel.yaml` is constrained to `>=0.18,!=0.19.0,<0.20`.
