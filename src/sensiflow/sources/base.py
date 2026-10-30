@@ -50,6 +50,8 @@ class ExistingTag:
     confidence: float | None = None
     origin: str | None = None
     not_pii: bool = False
+
+
 @runtime_checkable
 class WritebackTarget(Protocol):
     """A catalog or project that derived markup can be written to (ADR-0006 §3).
