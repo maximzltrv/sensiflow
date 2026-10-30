@@ -9,8 +9,8 @@ beyond the developer's own suites:
 * dbt edge inputs: malformed markers, shared properties files, traversal via
   symlinks, flow style, crash mid-apply, multi-level convergence (§4/§6);
 * stale detection scoped to the traced subgraph through the CLI (§7);
-* defects found in review, pinned as ``xfail(strict=True)`` so the suite stays
-  green today and flips red the moment a fix lands (then drop the marker).
+* defects found in review, pinned as regression tests (the deferred BOM
+  fidelity defect remains an ``xfail(strict=True)`` until it is fixed).
 
 All project, model, column and host names are synthetic.
 """
@@ -29,6 +29,7 @@ import yaml
 from sensiflow import (
     ExistingTag,
     Finding,
+    GateRisk,
     NodeResult,
     PiiTag,
     Risk,
@@ -44,8 +45,7 @@ from sensiflow import (
 )
 from sensiflow.cli import main
 from sensiflow.sources.dbt import DbtSource
-from tests.test_openmetadata_writeback import STG as OMD_STG
-from tests.test_openmetadata_writeback import FakeOmd, label
+from tests.support import PREFIX, FakeOmd, actions, label, regenerate_manifest
 
 PROJECT = "acme_demo"
 SRC = f"source.{PROJECT}.crm.raw_people"
@@ -55,6 +55,7 @@ WIDE = f"model.{PROJECT}.wide_people"
 WIDER = f"model.{PROJECT}.wider_people"
 SIDE = f"model.{PROJECT}.side_people"
 MARKER = "Sensiflow.Propagated"
+OMD_STG = f"{PREFIX}.stg_customers"
 
 
 # --- synthetic dbt project builder ---------------------------------------------------------------
@@ -117,25 +118,6 @@ def set_sql(root: Path, node_id: str, sql: str) -> None:
     path.write_text(json.dumps(manifest))
 
 
-def regenerate_manifest(root: Path) -> None:
-    """Simulate `dbt parse`: copy column entries from every properties file into the manifest."""
-    path = root / "manifest.json"
-    manifest = json.loads(path.read_text())
-    by_name = {n["name"]: n for n in manifest["nodes"].values()}
-    for yml in root.rglob("*.yml"):
-        document = yaml.safe_load(yml.read_text()) or {}
-        if not isinstance(document, dict):
-            continue
-        for entry in document.get("models") or []:
-            node = by_name.get(entry["name"])
-            if node is not None:
-                node["columns"] = {
-                    c["name"]: {"name": c["name"], "meta": c.get("meta") or {}}
-                    for c in entry.get("columns") or []
-                }
-    path.write_text(json.dumps(manifest))
-
-
 def dbt_diff(
     root: Path, min_risk: Risk = "LOW", min_confidence: float = 0.0
 ) -> tuple[DbtSource, WritebackDiff]:
@@ -144,10 +126,6 @@ def dbt_diff(
         trace(source.build_graph()), min_risk=min_risk, min_confidence=min_confidence
     )
     return source, diff_writeback(plan, source)
-
-
-def actions(diff: WritebackDiff) -> dict[tuple[str, str], str]:
-    return {(c.node_id, c.column): c.action for c in diff.changes}
 
 
 STG_ONLY = {"stg_people": ("SELECT person_key, email FROM raw_people", [SRC], "models/schema.yml")}
@@ -173,13 +151,13 @@ def _result_with(confidences: tuple[float, ...], risk: Risk) -> TraceResult:
 @pytest.mark.parametrize("min_risk", ["LOW", "MEDIUM", "HIGH"])
 @pytest.mark.parametrize("risk", ["ORIGIN", "LOW", "MEDIUM", "HIGH", "NONE"])
 def test_plan_selection_is_exactly_the_gate_selection(
-    floor: float, min_risk: Risk, risk: Risk
+    floor: float, min_risk: GateRisk, risk: Risk
 ) -> None:
     # One confidence semantics across check and propagate: a finding is written
     # iff it would gate, and suppressed iff the gate would suppress it.
     result = _result_with(_CONFIDENCES, risk)
     plan = plan_writeback(result, min_risk=min_risk, min_confidence=floor)
-    gate = evaluate_gate(result, fail_on=min_risk, min_confidence=floor)  # type: ignore[arg-type]
+    gate = evaluate_gate(result, fail_on=min_risk, min_confidence=floor)
 
     gate_suppressed = {f.column for _, f in gate.suppressed}
     gate_gating = {
@@ -211,12 +189,6 @@ _STATES: dict[str, tuple[list[dict[str, str]], dict[str, Any] | None]] = {
     "managed_non_sensitive": (
         [label("PII.NonSensitive"), label(MARKER)],
         {"pii": True, "pii_sensitive": False, "sensiflow": _PROV},
-    ),
-    # Human markup AND the marker on one column: the marker makes it tool-managed
-    # on both targets (ADR-0006 §7: human markup = anything without the marker).
-    "human_tag_plus_marker": (
-        [label("PII.NonSensitive") | {"labelType": "Manual", "state": "Confirmed"}, label(MARKER)],
-        {"pii": True, "pii_sensitive": False, "owner": "data_team", "sensiflow": _PROV},
     ),
 }
 
@@ -257,12 +229,19 @@ def test_omd_and_dbt_classify_the_same_markup_state_identically(
     assert _omd_action(tags, sensitive) == _dbt_action(tmp_path, meta, sensitive)
 
 
-def test_omd_human_tag_plus_marker_is_managed_and_does_not_seed() -> None:
+def test_omd_confirmed_label_plus_marker_is_human_authority_but_still_does_not_seed() -> None:
+    # ADR-0006 A1: a steward-confirmed (Manual/Confirmed) label next to the marker
+    # is human-ratified: the diff treats it as human markup (never updated), while
+    # seeding stays marker-only until the marker is removed. dbt has no label
+    # state, so there the block alone decides: an accepted, documented asymmetry.
     omd = FakeOmd()
-    omd.column(OMD_STG, "email")["tags"] = _STATES["human_tag_plus_marker"][0]
+    confirmed = label("PII.NonSensitive") | {"labelType": "Manual", "state": "Confirmed"}
+    omd.column(OMD_STG, "email")["tags"] = [confirmed, label(MARKER)]
     source = omd.source()
-    assert source.read_markup([OMD_STG])[(OMD_STG, "email")].managed is True
+    assert source.read_markup([OMD_STG])[(OMD_STG, "email")].managed is False
     assert "email" not in source.build_graph().nodes[OMD_STG].declared_pii
+    assert _omd_action([confirmed, label(MARKER)], True) == "conflict"
+    assert _omd_action([confirmed, label(MARKER)], False) == "manual"
 
 
 # --- dbt: malformed markers ----------------------------------------------------------------------
@@ -523,7 +502,7 @@ def test_empty_plan_apply_yes_is_exit_zero_and_touches_no_file(
     document = json.loads(capsys.readouterr().out)
     assert document["mode"] == "apply"
     assert document["changes"] == []
-    assert document["applied"] == {"applied": [], "failed": []}
+    assert document["applied"] == {"applied": [], "skipped": [], "failed": []}
     assert (path.read_bytes(), path.stat().st_mtime_ns, sorted(os.listdir(path.parent))) == before
 
 
@@ -561,15 +540,9 @@ def test_stale_detection_is_scoped_to_the_traced_subgraph_via_cli(
     assert [(c["node_id"], c["column"]) for c in stale] == [(SIDE, "legacy_col")]
 
 
-# --- defects found in review (xfail strict: remove the marker when fixed) ------------------------
+# --- defects found in review (fixed in the ADR-0006 fix round; BOM stays pinned) ----------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="QA defect: dbt human `pii: false` (explicit not-PII) vs a derived non-sensitive "
-    "finding is classified 'manual'; ADR-0006 §7 says 'human says non-PII where tool derives "
-    "PII' is a conflict (sources/dbt.py _human_tag maps pii:false to a non-sensitive PiiTag)",
-)
 def test_dbt_human_not_pii_contradicts_a_non_sensitive_derivation(tmp_path: Path) -> None:
     yml = BASE_YML + "      - name: email\n        meta:\n          pii: false\n"
     root = make_project(tmp_path / "proj", STG_ONLY, {"models/schema.yml": yml})
@@ -578,12 +551,6 @@ def test_dbt_human_not_pii_contradicts_a_non_sensitive_derivation(tmp_path: Path
     assert diff.changes[0].action == "conflict"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="QA defect: managed dbt markup whose pii_category no longer matches the finding "
-    "is 'unchanged' (writeback._managed_drift never compares category), so a wrong category "
-    "the tool wrote stays in the YAML forever",
-)
 def test_dbt_managed_category_drift_is_an_update(tmp_path: Path) -> None:
     models = {"stg_people": ("SELECT email AS contact FROM raw_people", [SRC], "models/schema.yml")}
     root = make_project(tmp_path / "proj", models, {"models/schema.yml": BASE_YML})
@@ -599,11 +566,6 @@ def test_dbt_managed_category_drift_is_an_update(tmp_path: Path) -> None:
     assert change.action == "update"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="QA defect: dbt write-back rewrites a CRLF properties file with LF line endings "
-    "(read_text universal newlines + newline='' write): every line of the file changes",
-)
 def test_dbt_apply_preserves_crlf_line_endings(tmp_path: Path) -> None:
     crlf = BASE_YML.replace("\n", "\r\n").encode()
     root = make_project(tmp_path / "proj", STG_ONLY, {"models/schema.yml": crlf})
@@ -614,12 +576,6 @@ def test_dbt_apply_preserves_crlf_line_endings(tmp_path: Path) -> None:
     assert b"\n" not in data.replace(b"\r\n", b"")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="QA defect: a comment line above an explicit '---' (e.g. a yaml-language-server "
-    "schema header) is destroyed together with the '---' on any edit (_dbt_yaml.py "
-    "explicit_start only checks text.lstrip().startswith('---'))",
-)
 def test_dbt_apply_keeps_a_header_comment_above_the_document_start(tmp_path: Path) -> None:
     header = "# yaml-language-server: $schema=https://schemas.example.test/dbt.json\n---\n"
     root = make_project(tmp_path / "proj", STG_ONLY, {"models/schema.yml": header + BASE_YML})
@@ -641,12 +597,6 @@ def test_dbt_apply_keeps_bom_and_document_start(tmp_path: Path) -> None:
     assert (root / "models/schema.yml").read_bytes().startswith("﻿---\n".encode())
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="QA defect: a JOIN-only HIGH finding (column not in the model's output) is written "
-    "to dbt YAML as an ordinary column entry — a phantom column, indistinguishable from a real "
-    "one, which breaks contract-enforced models; ADR-0006 §7 expects 'unmatched'",
-)
 def test_dbt_join_only_high_is_not_written_as_a_column(tmp_path: Path) -> None:
     models = {
         **STG_ONLY,
@@ -664,12 +614,6 @@ def test_dbt_join_only_high_is_not_written_as_a_column(tmp_path: Path) -> None:
     assert joined[0].action == "unmatched"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="QA defect: dbt write_changes trusts the diff — human markup that appears between "
-    "diff and apply gets the sensiflow marker stamped onto it (human > tool violated; the "
-    "OMD target re-checks live state, ADR-0006 §5, the dbt target does not)",
-)
 def test_dbt_human_markup_appearing_after_the_diff_is_not_claimed(tmp_path: Path) -> None:
     root = make_project(
         tmp_path / "proj", STG_ONLY, {"models/schema.yml": BASE_YML + "      - name: email\n"}
@@ -685,11 +629,6 @@ def test_dbt_human_markup_appearing_after_the_diff_is_not_claimed(tmp_path: Path
     assert meta == {"pii": False}
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="QA defect (minor): a column entry with PII meta but no `name` crashes read_markup "
-    "with KeyError (sources/dbt.py read_markup: column['name'])",
-)
 def test_dbt_nameless_column_entry_does_not_crash_the_diff(tmp_path: Path) -> None:
     yml = BASE_YML + "      - description: orphan\n        meta: {pii: true}\n"
     root = make_project(tmp_path / "proj", STG_ONLY, {"models/schema.yml": yml})
@@ -697,11 +636,6 @@ def test_dbt_nameless_column_entry_does_not_crash_the_diff(tmp_path: Path) -> No
     assert (STG, "email") in actions(diff)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="QA defect (minor): duplicate column entries — read_markup keeps the LAST, "
-    "write_changes edits the FIRST, so an 'update' is re-planned forever (never converges)",
-)
 def test_dbt_duplicate_column_entries_converge(tmp_path: Path) -> None:
     stale_block = (
         "      - name: email\n        meta:\n          pii: true\n          pii_category: email\n"
@@ -715,11 +649,6 @@ def test_dbt_duplicate_column_entries_converge(tmp_path: Path) -> None:
     assert rediff.pending == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="QA defect (minor): ruamel dumps YAML 1.2, dbt reads YAML 1.1 — a column named "
-    "`on`/`yes`/`no`/`off` is added unquoted and dbt parses its name as a boolean",
-)
 @pytest.mark.parametrize("column", ["on", "yes"])
 def test_dbt_added_column_name_survives_a_yaml_1_1_reader(tmp_path: Path, column: str) -> None:
     models = {
@@ -732,11 +661,6 @@ def test_dbt_added_column_name_survives_a_yaml_1_1_reader(tmp_path: Path, column
     assert [c["name"] for c in columns] == ["person_key", column]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="QA defect (minor): the unmatched-model YAML snippet interpolates names unquoted; "
-    "a column named `on` pastes as a boolean key value",
-)
 def test_dbt_unmatched_snippet_quotes_yaml_significant_names(tmp_path: Path) -> None:
     models = {"stg_people": ("SELECT email AS on FROM raw_people", [SRC], None)}
     root = make_project(tmp_path / "proj", models, {})
@@ -766,27 +690,31 @@ def test_omd_existing_tag_carries_no_provenance_so_only_sensitivity_drives_updat
     omd = FakeOmd()
     omd.column(OMD_STG, "email")["tags"] = [label("PII.Sensitive"), label(MARKER)]
     markup = omd.source().read_markup([OMD_STG])[(OMD_STG, "email")]
-    assert markup == ExistingTag(PiiTag("pii", True), managed=True)
-    for risk, conf, origin in [("LOW", 0.0, ""), ("HIGH", 1.0, "x.y.z"), ("MEDIUM", 0.12345, "o")]:
-        change = TagChange(OMD_STG, "stg", "email", PiiTag("email"), risk, conf, origin)  # type: ignore[arg-type]
+    assert markup == ExistingTag(sensitive=True, managed=True)
+    provenances: list[tuple[Risk, float, str]] = [
+        ("LOW", 0.0, ""),
+        ("HIGH", 1.0, "x.y.z"),
+        ("MEDIUM", 0.12345, "o"),
+    ]
+    for risk, conf, origin in provenances:
+        change = TagChange(OMD_STG, "stg", "email", PiiTag("email"), risk, conf, origin)
         plan = TagPlan("LOW", 0.0, [change], [], traced_nodes={OMD_STG: "stg"})
         assert diff_writeback(plan, omd.source()).changes[0].action == "unchanged"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="QA defect (minor): OMD update replaces the FIRST PII.* label on a managed column; "
-    "with a second (human, Manual) PII label first in the list it overwrites the human label "
-    "and never converges (mostly masked by OMD's mutually exclusive PII classification)",
-)
-def test_omd_update_on_a_column_with_two_pii_labels_converges_and_spares_the_human() -> None:
+def test_omd_update_replaces_the_managed_slot_and_spares_a_human_label_before_it() -> None:
+    # ADR-0006 A1: the replace targets the Automated+Suggested label's own slot,
+    # never "the first PII.* label" (which here is a human's).
     omd = FakeOmd()
-    human = label("PII.NonSensitive") | {"labelType": "Manual", "state": "Confirmed"}
-    omd.column(OMD_STG, "email")["tags"] = [human, label("PII.Sensitive"), label(MARKER)]
+    human = label("PII.Sensitive") | {"labelType": "Manual", "state": "Confirmed"}
+    managed = label("PII.NonSensitive")
+    omd.column(OMD_STG, "email")["tags"] = [human, managed, label(MARKER)]
     source = omd.source()
-    plan = _plan_for(OMD_STG, sensitive=False)
+    plan = _plan_for(OMD_STG, sensitive=True)
     diff = diff_writeback(plan, source)
     assert diff.changes[0].action == "update"
-    apply_writeback(diff, source, confirm=True)
-    assert human in omd.column(OMD_STG, "email")["tags"]
+    assert not apply_writeback(diff, source, confirm=True).failed
+    tags = omd.column(OMD_STG, "email")["tags"]
+    assert tags[0] == human
+    assert tags[1]["tagFQN"] == "PII.Sensitive"
     assert diff_writeback(plan, source).pending == []
