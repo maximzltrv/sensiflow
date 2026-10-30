@@ -17,7 +17,6 @@ from sensiflow import (
     ApplyResult,
     ExistingTag,
     LineageGraph,
-    PiiTag,
     SensiflowConnectionError,
     TagChange,
 )
@@ -123,7 +122,7 @@ def test_dry_run_with_conflicts_still_exits_zero_and_shows_them_first(
 
     def build_then_place(selection: GraphSelection | None = None) -> LineageGraph:
         graph = real_build(selection)
-        source.set_markup("dim_customers", "email", ExistingTag(PiiTag("pii", False), False))
+        source.set_markup("dim_customers", "email", ExistingTag(False, False, "pii"))
         return graph
 
     monkeypatch.setattr(source, "build_graph", build_then_place)
@@ -161,7 +160,10 @@ def test_json_dry_run_golden(capsys: pytest.CaptureFixture[str]) -> None:
                 "confidence": 0.729,
                 "origin": RAW,
                 "action": "unmatched",
-                "detail": "column is not in the node's output schema",
+                "detail": (
+                    "column is not part of the node's output (used only in JOIN/WHERE), so there "
+                    "is no column to tag; the exposure remains visible in report/check"
+                ),
             }
         ],
         "suppressed": [],
@@ -201,12 +203,12 @@ def test_full_mock_cycle_apply_then_converged_rerun(
     # The resolved diff is printed before anything is applied, then the outcome.
     assert out.index("ADD — markup to be written: 7") < out.index("applying 7 pending changes")
     assert out.index("applying 7") < out.index("applied: 7")
-    assert "result: APPLIED — 7 applied, 0 failed" in out
+    assert "result: APPLIED — 7 applied, 0 skipped, 0 failed" in out
 
     assert main(["propagate", "--min-risk", "low", "--apply", "--yes"]) == 0
     rerun = capsys.readouterr().out
     assert "unchanged=7" in rerun
-    assert "result: APPLIED — 0 applied, 0 failed" in rerun
+    assert "result: APPLIED — 0 applied, 0 skipped, 0 failed" in rerun
 
 
 def test_json_apply_document_carries_the_outcome(
@@ -223,7 +225,7 @@ def test_json_apply_document_carries_the_outcome(
 
 def test_apply_with_nothing_to_do_is_exit_zero(capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["propagate", "--min-risk", "high", "--apply", "--yes"]) == 0
-    assert "result: APPLIED — 0 applied, 0 failed" in capsys.readouterr().out
+    assert "result: APPLIED — 0 applied, 0 skipped, 0 failed" in capsys.readouterr().out
 
 
 def test_partial_failure_is_exit_three_and_lists_both_sides(
@@ -235,7 +237,7 @@ def test_partial_failure_is_exit_three_and_lists_both_sides(
     assert "applied: 4" in out
     assert "failed: 1" in out
     assert "error: simulated write failure" in out
-    assert "result: APPLIED — 4 applied, 1 failed" in out
+    assert "result: PARTIAL — 4 applied, 0 skipped, 1 failed; re-run to converge" in out
 
 
 def test_json_partial_failure_is_exit_three(
@@ -281,3 +283,56 @@ def test_dry_run_never_calls_write_changes(monkeypatch: pytest.MonkeyPatch) -> N
 
     use_source(monkeypatch, NoWrites())
     assert main(["propagate", "--min-risk", "low", "--yes"]) == 0  # --yes alone does not apply
+
+
+# --- skipped entries are not failures (ADR-0006 A3) -------------------------------------------
+
+
+class _SkippingMock(MockSource):
+    """A mock whose write path skips every change and optionally fails one."""
+
+    def __init__(self, *, fail_first: bool = False) -> None:
+        super().__init__()
+        self._fail_first = fail_first
+
+    def write_changes(self, changes: Sequence[TagChange]) -> ApplyResult:
+        result = ApplyResult(applied=[], failed=[])
+        for index, change in enumerate(changes):
+            if self._fail_first and index == 0:
+                result.failed.append((change, "simulated write failure"))
+            else:
+                result.skipped.append((change, "skipped: re-check found manual"))
+        return result
+
+
+def test_a_skip_only_apply_exits_zero_and_lists_the_skips(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    use_source(monkeypatch, _SkippingMock())
+    assert main(["propagate", "--min-risk", "medium", "--apply", "--yes"]) == 0
+    out = capsys.readouterr().out
+    assert "skipped: 5" in out
+    assert "reason: skipped: re-check found manual" in out
+    assert "result: APPLIED — 0 applied, 5 skipped, 0 failed" in out
+
+
+def test_any_failure_wins_over_skips_and_is_exit_three(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    use_source(monkeypatch, _SkippingMock(fail_first=True))
+    assert main(["propagate", "--min-risk", "medium", "--apply", "--yes"]) == 3
+    out = capsys.readouterr().out
+    assert "result: PARTIAL — 0 applied, 4 skipped, 1 failed" in out
+    assert "APPLIED" not in out.rsplit("result:", 1)[1]
+
+
+def test_json_apply_document_carries_the_skipped_array(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    use_source(monkeypatch, _SkippingMock())
+    args = ["propagate", "--min-risk", "medium", "--apply", "--yes", "--format", "json"]
+    assert main(args) == 0
+    block = json.loads(capsys.readouterr().out)["applied"]
+    assert block["applied"] == [] and block["failed"] == []
+    assert len(block["skipped"]) == 5
+    assert block["skipped"][0]["reason"] == "skipped: re-check found manual"
