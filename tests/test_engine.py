@@ -172,3 +172,47 @@ def test_by_risk_filters_and_orders() -> None:
         "dim_customers",
         "mart_customer_dump",
     }
+
+
+# --- in_output: JOIN/WHERE-only findings are flagged (ADR-0006 A6) ----------
+
+
+def _two_node_graph(sql: str) -> LineageGraph:
+    return LineageGraph(
+        nodes={
+            "raw": Node("raw", "raw", declared_pii={"email": PiiTag("email")}),
+            "down": Node("down", "down", upstream=["raw"], sql=sql),
+        }
+    )
+
+
+def test_join_only_finding_is_not_in_output(mock_result: dict[str, NodeResult]) -> None:
+    finding = mock_result["mart_orders_enriched"].findings["email"]
+    assert finding.risk == "HIGH"
+    assert finding.in_output is False
+
+
+def test_every_other_mock_finding_is_in_output(mock_result: dict[str, NodeResult]) -> None:
+    for node in mock_result.values():
+        for finding in node.findings.values():
+            if (node.node_id, finding.column) != ("mart_orders_enriched", "email"):
+                assert finding.in_output is True
+
+
+def test_join_and_projected_column_is_in_output() -> None:
+    sql = "SELECT r.email FROM raw AS r JOIN other AS o ON r.email = o.email"
+    finding = trace(_two_node_graph(sql)).nodes["down"].findings["email"]
+    assert (finding.risk, finding.in_output) == ("HIGH", True)
+
+
+def test_join_on_a_column_that_is_only_aliased_away_is_not_in_output() -> None:
+    sql = "SELECT r.email AS contact FROM raw AS r JOIN other AS o ON r.email = o.email"
+    findings = trace(_two_node_graph(sql)).nodes["down"].findings
+    assert (findings["email"].risk, findings["email"].in_output) == ("HIGH", False)
+    assert (findings["contact"].risk, findings["contact"].in_output) == ("MEDIUM", True)
+
+
+def test_where_only_column_with_select_star_is_in_output() -> None:
+    sql = "SELECT * FROM raw WHERE email IS NOT NULL"
+    finding = trace(_two_node_graph(sql)).nodes["down"].findings["email"]
+    assert (finding.risk, finding.in_output) == ("HIGH", True)

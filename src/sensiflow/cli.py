@@ -14,10 +14,19 @@ from sensiflow.engine import trace
 from sensiflow.exceptions import SensiflowError, SensiflowInputError
 from sensiflow.gate import evaluate_gate
 from sensiflow.model import TraceResult
-from sensiflow.report import render_check_json, render_check_text, render_json, render_text
+from sensiflow.report import (
+    render_apply_text,
+    render_check_json,
+    render_check_text,
+    render_json,
+    render_plan_json,
+    render_plan_text,
+    render_text,
+)
 from sensiflow.root_selectors import GraphSelection, has_glob_chars, load_roots_file
-from sensiflow.sources.base import LineageSource
+from sensiflow.sources.base import LineageSource, WritebackTarget
 from sensiflow.sources.mock import MockSource
+from sensiflow.writeback import apply_writeback, diff_writeback, plan_writeback
 
 
 class ExitCode(IntEnum):
@@ -31,7 +40,7 @@ class ExitCode(IntEnum):
 
 _EXIT_CODE_EPILOG = (
     "exit codes: 0 = clean pass, 1 = gate tripped (check only), "
-    "2 = usage/input error, 3 = operational error"
+    "2 = usage/input error, 3 = operational error (propagate: incl. failed writes)"
 )
 
 
@@ -155,6 +164,57 @@ def _build_parser() -> argparse.ArgumentParser:
         default="text",
         help="output format (default: text)",
     )
+
+    propagate = subparsers.add_parser(
+        "propagate",
+        parents=[common],
+        help="write derived PII markup back to the source (dry-run unless --apply --yes)",
+        epilog=_EXIT_CODE_EPILOG,
+    )
+    propagate.add_argument(
+        "--min-risk",
+        type=str.upper,
+        choices=["LOW", "MEDIUM", "HIGH"],
+        required=True,
+        help="lowest risk to write back (required; case-insensitive)",
+    )
+    propagate.add_argument(
+        "--min-confidence",
+        type=float,
+        default=0.0,
+        metavar="X",
+        help=(
+            "minimum finding confidence to write, 0.0-1.0 (default: 0.0); "
+            "filtered findings are reported, never hidden"
+        ),
+    )
+    mode = propagate.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="show what would be written, change nothing (the default)",
+    )
+    mode.add_argument(
+        "--apply",
+        action="store_true",
+        help="write the pending changes to the source; requires --yes",
+    )
+    propagate.add_argument(
+        "--yes",
+        action="store_true",
+        help="confirm --apply (there is no interactive prompt)",
+    )
+    propagate.add_argument(
+        "--dbt-project-dir",
+        metavar="PATH",
+        help="dbt project directory holding the properties YAML files (required with --source dbt)",
+    )
+    propagate.add_argument(
+        "--format",
+        choices=["text", "json"],
+        default="text",
+        help="output format (default: text)",
+    )
     return parser
 
 
@@ -174,9 +234,15 @@ def _make_source(parser: argparse.ArgumentParser, args: argparse.Namespace) -> L
     if args.source == "dbt":
         if not args.dbt_manifest:
             parser.error("--source dbt requires --dbt-manifest PATH")
+        project_dir = getattr(args, "dbt_project_dir", None)
+        if args.command == "propagate" and not project_dir:
+            parser.error(
+                "--source dbt with propagate requires --dbt-project-dir PATH "
+                "(the properties YAML files are what gets read and edited)"
+            )
         from sensiflow.sources.dbt import DbtSource
 
-        return DbtSource(args.dbt_manifest)
+        return DbtSource(args.dbt_manifest, project_dir)
     return MockSource()
 
 
@@ -199,11 +265,14 @@ def _build_selection(args: argparse.Namespace) -> GraphSelection:
     )
 
 
-def _run_trace(parser: argparse.ArgumentParser, args: argparse.Namespace) -> TraceResult:
-    """The shared pipeline: source -> graph -> trace (identical for report and check)."""
-    source = _make_source(parser, args)
+def _trace_source(source: LineageSource, args: argparse.Namespace) -> TraceResult:
     graph = source.build_graph(_build_selection(args))
     return trace(graph, dialect=args.dialect)
+
+
+def _run_trace(parser: argparse.ArgumentParser, args: argparse.Namespace) -> TraceResult:
+    """The shared pipeline: source -> graph -> trace (identical for report and check)."""
+    return _trace_source(_make_source(parser, args), args)
 
 
 def _error_exit_code(exc: SensiflowError) -> ExitCode:
@@ -271,6 +340,43 @@ def _run_check(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
     return _guarded(compute)
 
 
+def _run_propagate(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
+    if args.apply and not args.yes:
+        # No interactive prompt (useless in CI): --yes *is* the consent.
+        parser.error("--apply requires --yes to confirm that the source will be modified")
+
+    def compute() -> tuple[str, ExitCode]:
+        source = _make_source(parser, args)
+        if not isinstance(source, WritebackTarget):
+            raise SensiflowInputError(
+                f"--source {args.source} does not support write-back (propagate)"
+            )
+        result = _trace_source(source, args)
+        plan = plan_writeback(
+            result, min_risk=args.min_risk, min_confidence=args.min_confidence
+        )
+        diff = diff_writeback(plan, source)
+        as_json = args.format == "json"
+        if not args.apply:
+            if as_json:
+                document = render_plan_json(diff, target=args.source)
+                return json.dumps(document, indent=2) + "\n", ExitCode.OK
+            return render_plan_text(diff, target=args.source), ExitCode.OK
+
+        if not as_json:
+            # The resolved diff goes out before anything is written.
+            print(render_plan_text(diff, target=args.source, applying=True), end="")
+            sys.stdout.flush()
+        outcome = apply_writeback(diff, source, confirm=True)
+        code = ExitCode.OPERATIONAL_ERROR if outcome.failed else ExitCode.OK
+        if as_json:
+            document = render_plan_json(diff, outcome, target=args.source)
+            return json.dumps(document, indent=2) + "\n", code
+        return render_apply_text(outcome), code
+
+    return _guarded(compute)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -281,6 +387,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "check":
         return _run_check(parser, args)
+    if args.command == "propagate":
+        return _run_propagate(parser, args)
     return _run_report(parser, args)
 
 

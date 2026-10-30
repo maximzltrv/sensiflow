@@ -15,16 +15,93 @@ All names are synthetic; there is no real company behind them.
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Sequence
+
 from sensiflow.model import LineageGraph, Node, PiiTag
 from sensiflow.root_selectors import GraphSelection
+from sensiflow.sources.base import ExistingTag
+from sensiflow.writeback import ApplyResult, TagChange
+
+#: Physical output schema of each fixture node: what a catalog would list as
+#: its columns. ``mart_orders_enriched`` does not output ``email`` (it only
+#: joins on it), so a JOIN-only HIGH finding there has no column to tag.
+_COLUMNS: dict[str, tuple[str, ...]] = {
+    "raw_customers": ("customer_id", "email", "phone", "full_name", "segment"),
+    "raw_orders": ("order_id", "customer_email", "order_date", "amount"),
+    "stg_customers": ("customer_id", "email", "phone", "full_name"),
+    "dim_customers": ("customer_id", "email", "full_name", "segment"),
+    "mart_orders_enriched": ("order_id", "order_date", "amount", "segment"),
+    "mart_customer_dump": ("customer_id", "email", "full_name", "segment"),
+    "mart_daily_revenue": ("order_date", "revenue"),
+}
+
+_Key = tuple[str, str]
 
 
 class MockSource:
-    """A LineageSource returning a small fixed synthetic graph.
+    """A LineageSource and WritebackTarget over a small fixed synthetic graph.
 
     The graph is a fixture: the selection is accepted (to satisfy the
-    LineageSource protocol) but ignored.
+    LineageSource protocol) but ignored. Markup lives in memory: ``write_changes``
+    mutates it and a subsequent ``read_markup`` / ``build_graph`` sees the
+    result, giving offline tests the full plan -> diff -> apply -> re-diff
+    cycle. Human markup (``managed=False``) seeds the graph like a real
+    catalog's tags would; managed markup never does (ADR-0006 §4).
+
+    ``fail_on`` makes ``write_changes`` fail for the given ``(node_id, column)``
+    pairs — a hook for exercising partial-failure paths.
     """
+
+    def __init__(
+        self,
+        markup: dict[_Key, ExistingTag] | None = None,
+        *,
+        fail_on: Iterable[_Key] = (),
+    ) -> None:
+        self._markup: dict[_Key, ExistingTag] = dict(markup or {})
+        self._fail_on = frozenset(fail_on)
+
+    # -- WritebackTarget -------------------------------------------------------
+
+    def set_markup(self, node_id: str, column: str, existing: ExistingTag) -> None:
+        """Place markup directly (test hook: simulate a human or a prior run)."""
+        self._markup[(node_id, column.lower())] = existing
+
+    def read_markup(self, node_ids: Sequence[str]) -> dict[_Key, ExistingTag]:
+        wanted = set(node_ids)
+        return {key: tag for key, tag in self._markup.items() if key[0] in wanted}
+
+    def find_unmatched(self, changes: Sequence[TagChange]) -> dict[_Key, str]:
+        unmatched: dict[_Key, str] = {}
+        for change in changes:
+            columns = _COLUMNS.get(change.node_id)
+            if columns is None:
+                unmatched[(change.node_id, change.column.lower())] = "node not found in target"
+            elif change.column.lower() not in columns:
+                unmatched[(change.node_id, change.column.lower())] = (
+                    "column is not in the node's output schema"
+                )
+        return unmatched
+
+    def write_changes(self, changes: Sequence[TagChange]) -> ApplyResult:
+        result = ApplyResult(applied=[], failed=[])
+        for change in changes:
+            key = (change.node_id, change.column.lower())
+            if key in self._fail_on:
+                result.failed.append((change, "simulated write failure"))
+                continue
+            self._markup[key] = ExistingTag(
+                sensitive=change.tag.sensitive,
+                managed=True,
+                category=change.tag.category,
+                risk=change.risk,
+                confidence=change.confidence,
+                origin=change.origin_node,
+            )
+            result.applied.append(change)
+        return result
+
+    # -- LineageSource ---------------------------------------------------------
 
     def build_graph(self, selection: GraphSelection | None = None) -> LineageGraph:
         nodes = [
@@ -92,4 +169,10 @@ class MockSource:
                 ),
             ),
         ]
-        return LineageGraph(nodes={node.id: node for node in nodes})
+        graph_nodes = {node.id: node for node in nodes}
+        for (node_id, column), existing in self._markup.items():
+            if not existing.managed and not existing.not_pii and node_id in graph_nodes:
+                graph_nodes[node_id].declared_pii[column] = PiiTag(
+                    existing.category or "pii", existing.sensitive
+                )
+        return LineageGraph(nodes=graph_nodes)

@@ -1,0 +1,28 @@
+# Staging models -- owned by the data platform team
+version: 2
+
+models:
+  # customers staging
+  - name: stg_customers
+    description: "Staged customers: one row per customer"   # keep the quotes
+    config:
+      materialized: view
+    columns:
+      - name: customer_id
+        description: 'Primary key'
+        tests:
+          - unique
+          - not_null
+      - name: email
+        description: Customer email   # documented by hand
+        tests: [not_null]
+      # phone is optional
+      - &phone_col
+        name: phone
+        description: "Phone, E.164"
+      - name: full_name
+
+  - name: stg_unrelated
+    columns:
+      - name: order_id
+# end of staging file
