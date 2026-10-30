@@ -164,7 +164,7 @@ class _Location:
 #: dbt's own configuration files are never properties files (ADR-0006 A7).
 _DENIED_FILES = frozenset({"dbt_project.yml", "profiles.yml", "packages.yml", "dependencies.yml"})
 _DENIED_DIRS = frozenset({".git", "target", "dbt_packages", "logs"})
-_UNSAFE_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp"})
+_UNSAFE_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp"})
 
 
 def _unsafe_text(*values: str) -> bool:
@@ -176,13 +176,19 @@ def _unsafe_text(*values: str) -> bool:
     return any(unicodedata.category(ch) in _UNSAFE_CATEGORIES for v in values for ch in v)
 
 
+def _unsafe_change(change: TagChange) -> bool:
+    """Whether any text the change would write (or name) is unsafe to emit into YAML."""
+    return _unsafe_text(change.column, change.node_name, change.tag.category, change.origin_node)
+
+
 def _writable_problem(relative: Path) -> str | None:
     """Why a project-relative path may not be edited, or None when it may (A7)."""
     if relative.suffix.lower() not in (".yml", ".yaml"):
         return "is not a .yml/.yaml file"
-    if relative.name in _DENIED_FILES:
+    # Case-folded: on case-insensitive filesystems ".GIT" is ".git".
+    if relative.name.casefold() in _DENIED_FILES:
         return "is a dbt configuration file"
-    if _DENIED_DIRS.intersection(relative.parts[:-1]):
+    if _DENIED_DIRS.intersection(part.casefold() for part in relative.parts[:-1]):
         return "is inside a generated or VCS directory"
     return None
 
@@ -298,7 +304,10 @@ def _atomic_write(path: Path, text: str) -> None:
         raise
 
 
-_UNSAFE_NAME = "column or model name contains line breaks or control characters; never written"
+_UNSAFE_NAME = (
+    "a column, model, category or origin text contains line breaks or control characters; "
+    "never written"
+)
 _DUPLICATE_COLUMNS = "duplicate column entries in the properties file; resolve manually"
 
 
@@ -323,7 +332,7 @@ def _recheck(properties: PropertiesFile, location: _Location, change: TagChange)
     Returns the column entry to edit (``None``: it must be added) or, when the
     write must not happen, a string with the reason.
     """
-    if _unsafe_text(change.column, change.node_name):
+    if _unsafe_change(change):
         return _UNSAFE_NAME
     entry = properties.find_entry(location.section, location.name)
     if entry is None:
@@ -392,7 +401,7 @@ class DbtSource:
         unmatched: dict[tuple[str, str], str] = {}
         for change in changes:
             key = (change.node_id, change.column.lower())
-            if _unsafe_text(change.column, change.node_name):
+            if _unsafe_change(change):
                 unmatched[key] = _UNSAFE_NAME
                 continue
             location = found.get(change.node_id)

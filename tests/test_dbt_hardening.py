@@ -94,7 +94,7 @@ def test_snippet_is_refused_for_names_with_control_or_line_break_characters(name
 def test_unmatched_detail_without_a_snippet_says_why(project: Path) -> None:
     detail = make_source(project).find_unmatched([change("e\nmail", node_id=UNDOC)])
     reason = detail[(UNDOC, "e\nmail")]
-    assert "column or model name contains line breaks or control characters" in reason
+    assert "line breaks or control characters" in reason
 
 
 # --- such names are never written ---
@@ -405,3 +405,50 @@ def test_not_pii_in_the_yaml_conflicts_with_either_derivation(project: Path) -> 
     for sensitive in (True, False):
         plan = plan_for(STG, "stg_customers", "email", sensitive=sensitive)
         assert diff_writeback(plan, source).changes[0].action == "conflict"
+
+
+# --- round-2 hardening ---
+
+
+@pytest.mark.parametrize(
+    "patch_path",
+    [
+        ".GIT/x.yml",
+        ".Git/info/x.yml",
+        "Target/x.yml",
+        "DBT_PACKAGES/p/x.yml",
+        "LOGS/x.yml",
+        "DBT_Project.yml",
+        "Profiles.YML",
+        "PACKAGES.yml",
+    ],
+)
+def test_the_write_allowlist_is_case_insensitive(project: Path, patch_path: str) -> None:
+    target = project / patch_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("models:\n  - name: stg_customers\n    columns: []\n")
+    before = target.read_bytes()
+    set_patch_path(project, STG, f"{P}://{patch_path}")
+    source, diff = run_diff(project)
+    assert {c.action for c in diff.changes if c.node_id == STG} == {"unmatched"}
+    apply_writeback(diff, source, confirm=True)
+    assert target.read_bytes() == before
+
+
+@pytest.mark.parametrize("field", ["category", "origin"])
+@pytest.mark.parametrize("bad", [NEL, LS, "a\nb", "a\ud800b"])
+def test_unsafe_category_or_origin_is_never_written(project: Path, field: str, bad: str) -> None:
+    tag = PiiTag(f"cat{bad}" if field == "category" else "email")
+    origin = f"o{bad}" if field == "origin" else "origin.node"
+    unsafe = TagChange(STG, "stg_customers", "email", tag, "MEDIUM", 0.9, origin)
+    source = make_source(project)
+    assert "never written" in source.find_unmatched([unsafe])[(STG, "email")]
+    before = (project / STAGING_YML).read_bytes()
+    result = source.write_changes([unsafe])
+    assert result.applied == [] and result.failed == []
+    assert "never written" in result.skipped[0][1]
+    assert (project / STAGING_YML).read_bytes() == before
+
+
+def test_lone_surrogates_are_unsafe_text() -> None:
+    assert _yaml_snippet("models", "m", change("a\ud800b")) is None
