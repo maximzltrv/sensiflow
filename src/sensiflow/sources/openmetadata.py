@@ -102,6 +102,8 @@ def _unsafe_fqn(fqn: str) -> bool:
     return (
         not fqn
         or ".." in fqn
+        or fqn.startswith(".")  # "." and ".x" collapse or escape the /name/ segment
+        or fqn.endswith(".")
         or any(ch in _FQN_FORBIDDEN or unicodedata.category(ch) == "Cc" for ch in fqn)
     )
 
@@ -143,21 +145,6 @@ def _markup_of(column: dict[str, Any]) -> tuple[ExistingTag | None, int | None]:
 
 def _existing_tag(column: dict[str, Any]) -> ExistingTag | None:
     return _markup_of(column)[0]
-
-
-def _is_patch_test_failure(response: Any) -> bool:
-    """A 400 whose message says a JSON Patch ``test`` operation failed.
-
-    The pinned column name or label no longer matches: the table changed
-    between the re-fetch and the PATCH. Any other 400 is a real error.
-    """
-    if response.status_code != 400:
-        return False
-    try:
-        message = response.json().get("message", "")
-    except (ValueError, AttributeError):
-        return False
-    return isinstance(message, str) and "test" in message.lower()
 
 
 def _tag_label(tag_fqn: str) -> dict[str, str]:
@@ -260,6 +247,10 @@ def _plan_patch(table: dict[str, Any], changes: list[TagChange]) -> _PatchPlan:
             if isinstance(column.get("tags"), list):
                 plan.ops.extend({"op": "add", "path": f"{base}/-", "value": lbl} for lbl in labels)
             else:
+                if "tags" in column:
+                    # A null array: pin it, so a tag added concurrently is not clobbered by
+                    # the whole-array add. An absent key is guarded by If-Match instead.
+                    plan.ops.append({"op": "test", "path": base, "value": None})
                 plan.ops.append({"op": "add", "path": base, "value": labels})
         plan.patched.append(change)
     return plan
@@ -548,9 +539,17 @@ class OpenMetadataSource:
                 headers={"If-Match": etag} if etag else None,
                 tolerate=frozenset({400, 412}),
             )
-            if response.status_code == 412 or _is_patch_test_failure(response):
+            if response.status_code == 412:
                 result.skipped.extend(
                     (c, "skipped: table modified concurrently; re-run") for c in plan.patched
+                )
+                return
+            if response.status_code == 400:
+                # Fail closed: a rejected patch may be a failed pinned test (concurrent
+                # edit) or a real error, and the two cannot be told apart reliably.
+                result.failed.extend(
+                    (c, "write rejected (possibly concurrent modification)")
+                    for c in plan.patched
                 )
                 return
             self._raise_for_status(response, f"/tables/{table_id}")

@@ -662,7 +662,7 @@ def test_a_concurrent_edit_makes_the_if_match_fail_and_skips_the_table() -> None
     assert omd.tag_fqns(STG, "email") == []  # nothing was written to the raced table
 
 
-def test_a_failed_patch_test_operation_skips_the_tables_changes() -> None:
+def test_a_failed_patch_test_operation_fails_closed_with_a_concurrency_hint() -> None:
     omd = FakeOmd()
     _, diff = run_plan(omd)
     original = omd.handle
@@ -682,9 +682,11 @@ def test_a_failed_patch_test_operation_skips_the_tables_changes() -> None:
         "http://omd.test", TOKEN, transport=httpx.MockTransport(reorder_before_patch)
     )
     result = apply_writeback(diff, flaky, confirm=True)
-    assert result.failed == []
-    assert {c.node_id for c, _ in result.skipped} == {STG}
-    assert all("modified concurrently" in msg for _, msg in result.skipped)
+    assert {c.node_id for c, _ in result.failed} == {STG}
+    assert all(
+        msg == "write rejected (possibly concurrent modification)" for _, msg in result.failed
+    )
+    assert result.skipped == []  # only a 412 is a benign skip
 
 
 def test_replace_operations_pin_the_label_they_replace() -> None:
@@ -698,14 +700,17 @@ def test_replace_operations_pin_the_label_they_replace() -> None:
     assert {"op": "test", "path": "/columns/1/name", "value": "email"} in tests
 
 
-def test_a_400_that_is_not_a_test_failure_is_a_real_failure() -> None:
+@pytest.mark.parametrize(
+    "message", ["malformed patch", "invalid column contest_name", "test operation failed", ""]
+)
+def test_every_400_fails_closed_whatever_its_message(message: str) -> None:
     omd = FakeOmd()
     _, diff = run_plan(omd)
     original = omd.handle
 
     def bad_request(request: httpx.Request) -> httpx.Response:
         if request.method == "PATCH":
-            return httpx.Response(400, json={"message": "malformed patch"})
+            return httpx.Response(400, json={"message": message})
         return original(request)
 
     broken = OpenMetadataSource(
@@ -714,7 +719,7 @@ def test_a_400_that_is_not_a_test_failure_is_a_real_failure() -> None:
     result = apply_writeback(diff, broken, confirm=True)
     assert result.skipped == []
     assert len(result.failed) == len(diff.pending)
-    assert all("returned 400" in msg for _, msg in result.failed)
+    assert all("write rejected" in msg for _, msg in result.failed)
 
 
 # --- skip-only runs mutate nothing; hostile payload shapes --------------------------------------
@@ -747,3 +752,42 @@ def test_a_non_object_payload_is_a_clean_connection_error() -> None:
     assert [m for _, m in result.failed] == [
         f"unexpected payload shape from http://omd.test for /tables/name/{STG}"
     ]
+
+
+# --- round-2 hardening ---
+
+
+@pytest.mark.parametrize("fqn", [".", ".x", "svc.", "svc.db.", ".."])
+def test_dot_only_and_edge_dot_names_are_unsafe(fqn: str) -> None:
+    assert _unsafe_fqn(fqn)
+
+
+def test_a_single_dot_never_reaches_the_wire() -> None:
+    omd = FakeOmd()
+    change = TagChange(".", "t", "email", EMAIL, "MEDIUM", 0.9, "raw")
+    assert omd.source().write_changes([change]).skipped
+    assert omd.requests == []
+
+
+def test_a_null_tags_array_is_pinned_before_the_whole_array_add() -> None:
+    omd = FakeOmd()
+    omd.column(STG, "email")["tags"] = None
+    source, diff = run_plan(omd)
+    apply_writeback(diff, source, confirm=True)
+    ops = json.loads(next(r for r in omd.patches if omd.tables[STG]["id"] in r.url.path).content)
+    position = ops.index({"op": "test", "path": "/columns/1/tags", "value": None})
+    assert ops[position + 1]["op"] == "add"
+    assert ops[position + 1]["path"] == "/columns/1/tags"
+    assert omd.tag_fqns(STG, "email") == ["PII.Sensitive", MARKER_TAG]
+
+
+def test_an_absent_tags_key_relies_on_if_match_not_a_null_test() -> None:
+    omd = FakeOmd()
+    del omd.column(STG, "email")["tags"]
+    source, diff = run_plan(omd)
+    apply_writeback(diff, source, confirm=True)
+    stg_patch = next(r for r in omd.patches if omd.tables[STG]["id"] in r.url.path)
+    assert "if-match" in stg_patch.headers
+    assert {"op": "test", "path": "/columns/1/tags", "value": None} not in json.loads(
+        stg_patch.content
+    )
