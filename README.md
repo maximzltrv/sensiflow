@@ -81,14 +81,23 @@ curl -s localhost:8000/v1/check -H 'Content-Type: application/json' \
 Catalog credentials are server-side configuration (`OMD_HOST`, `OMD_TOKEN`) and
 never part of a request; use a read-only catalog token. Set `SENSIFLOW_API_TOKEN`
 to require `Authorization: Bearer <token>` on `/v1/report` and `/v1/check`
-(unset means the API is open, and the server logs a warning at startup). The
-server speaks plain HTTP: terminate TLS at your reverse proxy. Interactive API
-docs are served at `/docs`.
+(unset means the API is open, and the server logs a warning at startup; a set
+but blank value refuses to start). The token is checked before the request body
+is read, and with a token configured the interactive docs (`/docs`, `/openapi.json`)
+are not served; without one they are available at `/docs`.
+
+Requests are limited to a 1 MiB body, 1000 `roots` and 100 `patterns`. The server
+speaks plain HTTP and has no per-request deadline: terminate TLS, enforce request
+timeouts, and add rate limiting at your reverse proxy. `fail_on` is
+case-insensitive. Error responses are `{"error": {"kind", "message"}}`; a source
+the deployment has not configured (for example `openmetadata` without `OMD_HOST`
+and `OMD_TOKEN`) is `503`, and catalog-side failures never echo the catalog address.
 
 ### Docker
 
 The image runs the server by default and doubles as a containerized CLI. Tag it
-with the package version:
+with the package version. Its healthcheck probes port 8000 (the default `CMD`); if
+you start the server on another port, override the healthcheck as well:
 
 ```bash
 docker build -t sensiflow:0.1.0 .

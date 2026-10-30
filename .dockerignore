@@ -7,8 +7,6 @@
 !poetry.lock
 !README.md
 !LICENSE
-!src/
-
-# Keep caches out even inside the re-included tree.
-**/__pycache__
-**/*.py[cod]
+# Only Python sources of the package: stray caches, editor droppings or data
+# files under src/ never reach the wheel.
+!src/sensiflow/**/*.py
