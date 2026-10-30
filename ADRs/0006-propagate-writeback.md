@@ -1,6 +1,7 @@
 # ADR-0006: `propagate` — explicit write-back of derived PII markup
 
-- **Status:** Proposed
+- **Status:** Accepted (2026-10-30, after review; all seven open questions
+  resolved as recommended — see Review resolutions)
 - **Date:** 2026-10-30
 - **Deciders:** Maksim Zolotarev
 
@@ -343,6 +344,14 @@ The write target for dbt is the **dbt project's properties YAML files**
 plus the reverse direction: a **managed** tag found by `read_markup` on a
 traced node with **no** supporting planned change becomes `stale`.
 
+**Authority hierarchy — human > tool — stated explicitly:** human-placed
+markup (anything without the sensiflow marker) is never overwritten and
+never stacked over, whether it agrees with the derivation (`manual`) or
+contradicts it (`conflict` — flagged prominently, skipped). Tool-managed
+markup — and only tool-managed markup, identified by the marker — may be
+updated or (in a future `--prune`) removed by the tool. There is no flag
+to override this hierarchy.
+
 - **Idempotency:** re-running `propagate --apply` immediately after an
   apply produces an all-`unchanged`/`manual` diff and writes nothing.
   Running it twice never duplicates a tag.
@@ -627,23 +636,31 @@ sensiflow propagate --min-risk {LOW|MEDIUM|HIGH}
     and complicates idempotency (which column "owns" the table tag?).
     Deferred — revisit with the risk-taxonomy non-goal if demand appears.
 
-## Open questions (for review)
+## Review resolutions (2026-10-30)
 
-1. **dbt write mechanism** — confirm in-place properties-YAML patching via
-   `ruamel.yaml` under the `[dbt]` extra (Decision §6), versus the
-   patch-file-only or snippet alternatives (1–4 above).
-2. **`--min-confidence` default for mutation** — `0.0` for cross-command
-   consistency (recommended, §8), or a stricter mutation-specific default?
-3. **`--min-risk` required with no default** — confirm the revision of the
-   earlier `--min-risk LOW` sketch (§8, alternative 10).
-4. **Removal out of scope in v1** — confirm that `stale` markup is
-   reported but never deleted until a dedicated `--prune` design (§7).
-5. **Marker names are public contract** — confirm `Sensiflow` /
-   `Sensiflow.Propagated` (OMD) and `meta.sensiflow.propagated` (dbt)
-   before anything is written into user catalogs; renaming later strands
-   already-written markers.
-6. **Dual-write (native + marker)** — confirm writing the native PII
-   conventions alongside the marker, given the coupled reader-side rule
-   that marked columns never seed (§4, alternatives 7–9).
-7. **OMD tag state** — confirm `state=Suggested` (humans confirm in the
-   catalog UI) rather than `Confirmed`.
+The seven questions the draft left open were resolved at review; every
+recommendation was confirmed as drafted.
+
+1. **dbt write mechanism** — in-place properties-YAML patching via
+   `ruamel.yaml` under the `[dbt]` extra, lazily imported (§6); the
+   patch-file-only and snippet alternatives stay rejected.
+2. **`--min-confidence` default for mutation** — `0.0`, a single
+   confidence semantics shared with `check` (ADR-0004 §5/A4:
+   published-precision inclusive comparison, suppressed findings always
+   surfaced). No mutation-specific default.
+3. **`--min-risk` required with no default** — confirmed; the earlier
+   public-API sketch (`--min-risk LOW` default) is formally revised (§8).
+4. **Removal out of scope in v1** — confirmed: `stale` markup is detected
+   and reported, never deleted, until a dedicated `--prune` design (§7).
+5. **Marker names frozen as public contract** — `Sensiflow` /
+   `Sensiflow.Propagated` (OpenMetadata) and `meta.sensiflow` with
+   `propagated: true` (dbt). Renaming later would strand already-written
+   markers, so these names are now fixed.
+6. **Dual-write (native + marker)** — confirmed, together with the coupled
+   reader-side rule: marked columns never seed, enforced in both
+   connectors in this same slice (§4).
+7. **OMD TagLabel state** — `state=Suggested`; humans confirm in the
+   catalog UI. Additionally confirmed at review: the authority hierarchy
+   is explicit — human-placed markup is never overwritten (conflicts are
+   flagged and skipped, compatible manual markup is left untouched); only
+   marker-bearing, tool-managed tags may be updated by the tool (§7).
