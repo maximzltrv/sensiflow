@@ -1,0 +1,105 @@
+{
+  "metadata": {
+    "project_name": "demo_shop"
+  },
+  "nodes": {
+    "model.demo_shop.stg_customers": {
+      "resource_type": "model",
+      "name": "stg_customers",
+      "package_name": "demo_shop",
+      "compiled_code": "SELECT customer_id, email, phone, full_name FROM raw_customers",
+      "depends_on": {
+        "nodes": [
+          "source.demo_shop.crm.raw_customers"
+        ]
+      },
+      "columns": {},
+      "patch_path": "demo_shop://models/staging/schema.yml"
+    },
+    "model.demo_shop.dim_customers": {
+      "resource_type": "model",
+      "name": "dim_customers",
+      "package_name": "demo_shop",
+      "compiled_code": "SELECT customer_id, email, full_name, segment FROM stg_customers",
+      "depends_on": {
+        "nodes": [
+          "model.demo_shop.stg_customers"
+        ]
+      },
+      "columns": {},
+      "patch_path": "demo_shop://models/marts/schema.yml"
+    },
+    "model.demo_shop.mart_customer_dump": {
+      "resource_type": "model",
+      "name": "mart_customer_dump",
+      "package_name": "demo_shop",
+      "compiled_code": "SELECT * FROM dim_customers",
+      "depends_on": {
+        "nodes": [
+          "model.demo_shop.dim_customers"
+        ]
+      },
+      "columns": {},
+      "patch_path": "demo_shop://models/marts/schema.yml"
+    },
+    "model.demo_shop.mart_undocumented": {
+      "resource_type": "model",
+      "name": "mart_undocumented",
+      "package_name": "demo_shop",
+      "compiled_code": "SELECT email FROM dim_customers",
+      "depends_on": {
+        "nodes": [
+          "model.demo_shop.dim_customers"
+        ]
+      },
+      "columns": {}
+    },
+    "model.vendor_pkg.pkg_model": {
+      "resource_type": "model",
+      "name": "pkg_model",
+      "package_name": "vendor_pkg",
+      "compiled_code": "SELECT email FROM dim_customers",
+      "depends_on": {
+        "nodes": [
+          "model.demo_shop.dim_customers"
+        ]
+      },
+      "columns": {},
+      "patch_path": "vendor_pkg://models/pkg.yml"
+    }
+  },
+  "sources": {
+    "source.demo_shop.crm.raw_customers": {
+      "resource_type": "source",
+      "name": "raw_customers",
+      "package_name": "demo_shop",
+      "columns": {
+        "customer_id": {
+          "name": "customer_id",
+          "meta": {}
+        },
+        "email": {
+          "name": "email",
+          "meta": {
+            "pii": true,
+            "pii_category": "email"
+          }
+        },
+        "phone": {
+          "name": "phone",
+          "meta": {
+            "pii": true,
+            "pii_category": "phone"
+          }
+        },
+        "full_name": {
+          "name": "full_name",
+          "meta": {
+            "pii": true,
+            "pii_category": "name"
+          }
+        }
+      }
+    }
+  }
+}
