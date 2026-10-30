@@ -1,6 +1,7 @@
 # ADR-0005: HTTP server API and distributable Docker image
 
-- **Status:** Proposed
+- **Status:** Accepted (2026-10-30, after review; all five open questions
+  resolved — see Review resolutions)
 - **Date:** 2026-10-30
 - **Deciders:** Maksim Zolotarev
 
@@ -307,16 +308,16 @@ No metrics/tracing exporters in v1 — each is a dependency and a config
 surface; the access log plus the per-request line cover the "is it working,
 what is it doing" minimum. Revisit on operational evidence.
 
-**API authentication (v1 stance, flagged as an open question):** the server
-ships an opt-in static bearer token — if `SENSIFLOW_API_TOKEN` is set in the
-environment, every `/v1/report` and `/v1/check` request must carry
+**API authentication (decided at review):** the server ships an opt-in
+static bearer token — if `SENSIFLOW_API_TOKEN` is set in the environment,
+every `/v1/report` and `/v1/check` request must carry
 `Authorization: Bearer <token>` (constant-time comparison); `/v1/health`
 stays open for probes. If unset, the API is open and the server logs a
 prominent startup warning. Rationale: the server fronts a catalog
 credential, so a zero-cost shared-secret guard is worth having from day one,
-while mandatory auth would complicate the local/demo path. This is the one
-decision in this ADR with a real argument for each alternative — see Open
-question 1.
+while mandatory auth would complicate the local/demo path (see Review
+resolution 1 and Alternatives: "no auth at all" and "mandatory token" were
+both considered and rejected in review).
 
 ### 8. CLI: `sensiflow serve`
 
@@ -371,8 +372,8 @@ A `Dockerfile` at the repo root, with these pinned properties:
 - **Tagging tied to the package version**: the image for a given build is
   tagged with the exact `__version__` (`sensiflow:<semver>`); mutable
   convenience tags (`latest`) point at the newest release. Image publication
-  (registry, automation) is a follow-up, not part of this slice — see Open
-  question 4.
+  to GHCR is a follow-up once repository CI exists, not part of this slice
+  (Review resolution 4).
 - **No compose file in v1.** A single stateless container needs only a
   `docker run` line, which the README documents. The genuinely useful
   compose — sensiflow next to a seeded OpenMetadata sandbox as a
@@ -424,7 +425,7 @@ A `Dockerfile` at the repo root, with these pinned properties:
 - **Opt-in (not mandatory) API auth** means a misconfigured deployment can
   expose catalog-derived PII *metadata* (column names, owners, lineage — not
   data values) to its network. Mitigated by the loud startup warning and
-  deployment docs; see Open question 1.
+  deployment docs; accepted at review (Review resolution 1).
 - **Single-process sync serving** caps throughput at roughly one CPU-bound
   trace at a time per container. Accepted for v1's load profile
   (CI calls, interactive queries); the scaling story is horizontal.
@@ -530,20 +531,23 @@ A `Dockerfile` at the repo root, with these pinned properties:
     agents; an MCP layer can later wrap the same library (or this API)
     without conflict. HTTP first. Deferred, not rejected.
 
-## Open questions (for the decider)
+## Review resolutions (2026-10-30)
 
-1. **API authentication in v1**: (a) opt-in static bearer token via
-   `SENSIFLOW_API_TOKEN` as drafted (recommended), (b) no auth at all in v1
-   (network perimeter only, simplest), or (c) token mandatory (safest,
-   worst demo/local UX)?
-2. **Confirm the credentials stance** (Decision 5): server-side env only,
-   per-request host/token rejected for v1 — accept the one-instance-one-
-   catalog consequence?
-3. **dbt over HTTP**: confirm deferral to v2? If server-side dbt is wanted
-   sooner, pick the direction now (allow-listed manifest directory vs
-   size-capped upload) so v1 can avoid contradicting it.
-4. **Image publication**: target registry (GHCR under the project's GitHub
-   org/user is the natural default) — and is publication in this slice or a
-   follow-up once repo CI exists (recommended: follow-up)?
-5. **Confirm no compose file in v1** and the OMD-sandbox demo compose as a
-   separate backlog item.
+The five questions the draft left open were resolved at review:
+
+1. **API authentication in v1: opt-in static bearer token** via
+   `SENSIFLOW_API_TOKEN`, as drafted in Decision 7, with the prominent
+   startup warning when unset. The alternatives — no auth at all (network
+   perimeter only) and a mandatory token — were both rejected: the former
+   leaves a credential-fronting service with zero built-in guard, the
+   latter hurts the local/demo path for little gain over opt-in.
+2. **Credentials stance confirmed** (Decision 5): server-side environment
+   configuration only; per-request host/token stays rejected; the
+   one-instance-one-catalog consequence is accepted.
+3. **dbt over HTTP: deferral to v2 confirmed.** v1 serves `openmetadata`
+   and `mock` only; the v2 direction (allow-listed manifest directory vs
+   size-capped upload) is decided when the work is scheduled.
+4. **Image publication: follow-up confirmed** — GHCR, automated once
+   repository CI exists; not part of this slice.
+5. **No compose file in v1 confirmed**; the OpenMetadata-sandbox demo
+   compose (with synthetic seed data) goes to the backlog as its own item.
