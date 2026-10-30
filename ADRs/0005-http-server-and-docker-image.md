@@ -213,7 +213,7 @@ versioned with the API:
 | Missing or invalid API token (when `SENSIFLOW_API_TOKEN` is set) | n/a | `401` | structured error body, kind `auth`, plus `WWW-Authenticate: Bearer` |
 | Request body exceeds the size cap | n/a | `413` | structured error body, kind `input` |
 | Malformed request body (framework validation) | 2 | `422` | FastAPI's native validation document |
-| Requested source not configured on this deployment (e.g. `openmetadata` without `OMD_HOST`/`OMD_TOKEN`) | n/a — in the CLI the caller *is* the operator, so it is a usage error, exit 2 | `503` | structured error body, kind `config` |
+| Requested source not configured — or misconfigured — on this deployment (`openmetadata` without `OMD_HOST`/`OMD_TOKEN`, or with an invalid `OMD_HOST` value) | n/a — in the CLI the caller *is* the operator, so it is a usage error, exit 2 | `503` | structured error body, kind `config` (fixed generic message; the rejected host value goes to the server log only) |
 | Catalog unreachable / catalog auth failure (`SensiflowConnectionError`) | 3 | `502` | structured error body, kind `connection` (fixed generic message) |
 | Server deployment lacks a required extra (`SensiflowDependencyError`) | 3 | `500` | structured error body, kind `dependency` (fixed generic message) |
 | Unexpected internal error | 3 | `500` | structured error body, kind `internal` (generic; traceback goes to the server log only, never to the client) |
@@ -653,7 +653,13 @@ accepted text are explicit:
    extending it is an ADR-level API decision.
 9. **Routing-level `404`/`405` keep the framework's `{"detail": ...}`
    shape** (§4), documented rather than unified.
-10. **Extras pinning policy noted:** optional-extra dependencies use lower
+10. **Invalid server-side catalog configuration is `config`/`503` too**
+    (§4): a syntactically invalid `OMD_HOST` (bad scheme, embedded
+    credentials) is the same caller-cannot-fix condition as an unset one —
+    the connector's host-validation error is translated to the `config`
+    kind at the server boundary, and the offending value stays in the
+    server log. The CLI keeps reporting it as a usage error (exit 2).
+11. **Extras pinning policy noted:** optional-extra dependencies use lower
     bounds only (no upper caps) — caps in a library create resolver
     conflicts for host applications; the sole caret constraint stays on
     sqlglot, whose AST internals the core consumes directly. Floor
