@@ -9,10 +9,9 @@ from sensiflow.gate import GateOutcome
 from sensiflow.model import RISK_RANK, Finding, NodeResult, TraceResult
 from sensiflow.writeback import ApplyResult, TagChange, WritebackAction, WritebackDiff
 
-#: Characters beyond category Cc that can reorder or hide text in a terminal.
-_SPOOFING = frozenset("\u2028\u2029\u200e\u200f\u061c") | {
-    chr(c) for c in (*range(0x202A, 0x202F), *range(0x2066, 0x206A))
-}
+#: Unicode categories escaped in text output: control, format (bidi marks, zero-width and
+#: tag characters), lone surrogates, line/paragraph separators, private-use and unassigned.
+_ESCAPED_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp", "Co", "Cn"})
 
 
 def _display(value: object, *, multiline: bool = False) -> str:
@@ -28,8 +27,14 @@ def _display(value: object, *, multiline: bool = False) -> str:
     for ch in str(value):
         if ch == "\n" and multiline:
             out.append(ch)
-        elif unicodedata.category(ch) == "Cc" or ch in _SPOOFING:
-            out.append(f"\\x{ord(ch):02x}" if ord(ch) < 0x100 else f"\\u{ord(ch):04x}")
+        elif unicodedata.category(ch) in _ESCAPED_CATEGORIES:
+            code = ord(ch)
+            if code < 0x100:
+                out.append(f"\\x{code:02x}")
+            elif code < 0x10000:
+                out.append(f"\\u{code:04x}")
+            else:
+                out.append(f"\\U{code:08x}")
         else:
             out.append(ch)
     return "".join(out)
@@ -232,7 +237,7 @@ def _plan_header(diff: WritebackDiff, mode: str, target: str) -> list[str]:
     plan = diff.plan
     counts = _action_counts(diff)
     lines = [
-        f"sensiflow propagate — min-risk={plan.min_risk} "
+        f"sensiflow propagate — min-risk={_display(plan.min_risk)} "
         f"min-confidence={plan.min_confidence:g} — target={_display(target)} — mode={mode}",
         "summary: " + "  ".join(f"{action}={counts[action]}" for action in _ACTION_ORDER),
     ]

@@ -284,3 +284,46 @@ def test_check_text_escapes_violations_and_suppressed_lines() -> None:
     unsuppressed = evaluate_gate(result, fail_on="LOW")
     assert unsuppressed.violations
     assert_terminal_safe(render_check_text(result, unsuppressed))
+
+
+# --- round-2: invisible characters and lone surrogates -------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("raw", "escaped"),
+    [
+        ("\ud800", "\\ud800"),
+        ("​", "\\u200b"),
+        ("⁠", "\\u2060"),
+        ("﻿", "\\ufeff"),
+        ("­", "\\xad"),
+        ("\U000e0041", "\\U000e0041"),  # tag character
+        ("", "\\ue000"),  # private use
+        ("\U0001f600", "\U0001f600"),  # an emoji is ordinary text
+    ],
+)
+def test_display_escapes_surrogates_invisible_and_private_use_characters(
+    raw: str, escaped: str
+) -> None:
+    assert _display(raw) == escaped
+
+
+def test_text_with_a_lone_surrogate_renders_and_encodes() -> None:
+    bad = "x" + chr(0xD800) + "y" + chr(0x200B) + "z"
+    changed = TagChange(
+        "n1", bad, bad, PiiTag(bad), "MEDIUM", 0.5, bad, action="conflict", detail=bad
+    )
+    document = WritebackDiff(
+        plan=TagPlan("LOW", 0.0, [changed], [changed], warnings=[bad]), changes=[changed]
+    )
+    text = render_plan_text(document, target=bad) + render_apply_text(
+        ApplyResult([changed], [(changed, bad)], [(changed, bad)])
+    )
+    text.encode("utf-8")  # must not raise: a surrogate would abort the whole dry-run print
+    assert "\\ud800" in text and "\\u200b" in text
+
+
+def test_min_risk_in_the_header_goes_through_display() -> None:
+    diff = hostile_diff()
+    diff.plan.min_risk = f"HIGH{ESC}"  # type: ignore[assignment]  # hostile, deliberately not a Risk
+    assert_terminal_safe(render_plan_text(diff))
