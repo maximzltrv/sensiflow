@@ -9,7 +9,6 @@ lineage envelope with entity/nodes/upstreamEdges/downstreamEdges. No network.
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from typing import Any
 
 import httpx
@@ -24,33 +23,10 @@ from sensiflow import (
 )
 from sensiflow.report import render_text
 from sensiflow.sources.openmetadata import OpenMetadataSource, _require_httpx
+from tests.support import BY_FQN, PREFIX, TABLES, TOKEN, lineage_payload
 
-FIXTURES = Path(__file__).parent / "fixtures" / "omd"
-TABLES: list[dict[str, Any]] = json.loads((FIXTURES / "tables.json").read_text())
-EDGES: list[dict[str, str]] = json.loads((FIXTURES / "edges.json").read_text())["edges"]
-BY_FQN = {t["fullyQualifiedName"]: t for t in TABLES}
-PREFIX = "demo.warehouse.crm"
 PAGE_SIZE = 3  # forces the full scan through several pages
-TOKEN = "fake-jwt-token-123"
-
-
-def _lineage_payload(fqn: str) -> dict[str, Any]:
-    entity = BY_FQN[fqn]
-    ups = [e["from"] for e in EDGES if e["to"] == fqn]
-    downs = [e["to"] for e in EDGES if e["from"] == fqn]
-    return {
-        "entity": {"id": entity["id"], "fullyQualifiedName": fqn, "type": "table"},
-        "nodes": [
-            {"id": BY_FQN[n]["id"], "fullyQualifiedName": n, "type": "table"}
-            for n in ups + downs
-        ],
-        "upstreamEdges": [
-            {"fromEntity": BY_FQN[u]["id"], "toEntity": entity["id"]} for u in ups
-        ],
-        "downstreamEdges": [
-            {"fromEntity": entity["id"], "toEntity": BY_FQN[d]["id"]} for d in downs
-        ],
-    }
+_lineage_payload = lineage_payload
 
 
 def _handler(request: httpx.Request) -> httpx.Response:

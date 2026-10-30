@@ -13,11 +13,14 @@ from __future__ import annotations
 
 import importlib
 import json
+import unicodedata
+import uuid
 from collections import deque
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
 from types import ModuleType
 from typing import TYPE_CHECKING, Any
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 from sensiflow.exceptions import (
     SensiflowConnectionError,
@@ -27,7 +30,7 @@ from sensiflow.exceptions import (
 from sensiflow.model import LineageGraph, Node, PiiTag
 from sensiflow.root_selectors import GraphSelection, resolve_patterns
 from sensiflow.sources.base import ExistingTag
-from sensiflow.writeback import ApplyResult, TagChange
+from sensiflow.writeback import ApplyResult, TagChange, recheck_reason, reclassify_change
 
 if TYPE_CHECKING:
     import httpx
@@ -85,22 +88,76 @@ def _declared_pii(table: dict[str, Any]) -> dict[str, PiiTag]:
     return declared
 
 
-def _existing_tag(column: dict[str, Any]) -> ExistingTag | None:
-    """The PII markup on one OMD column in the neutral write-back shape.
+#: Characters that would change the meaning of an FQN interpolated into a URL path.
+_FQN_FORBIDDEN = frozenset("/\\?#%;")
 
-    ``managed`` iff the marker tag is present. Sensitive wins when a column
-    carries both PII labels (the conservative reading).
+
+def _unsafe_fqn(fqn: str) -> bool:
+    """True when an FQN cannot be put in a URL path as-is (ADR-0006 A7).
+
+    Catalog content is untrusted: a name carrying path, query or fragment
+    metacharacters, a raw ``%``, ``;``, control characters or a ``..`` segment
+    could address a different API resource than the one named in the plan.
+    """
+    return (
+        not fqn
+        or ".." in fqn
+        or any(ch in _FQN_FORBIDDEN or unicodedata.category(ch) == "Cc" for ch in fqn)
+    )
+
+
+def _name_path(prefix: str, fqn: str) -> str:
+    """``/prefix/name/<fqn>`` with the FQN percent-encoded (callers validated it first)."""
+    return f"{prefix}/name/{quote(fqn, safe='')}"
+
+
+def _is_unconfirmed_automated(label: Any) -> bool:
+    return (
+        isinstance(label, dict)
+        and label.get("labelType") == "Automated"
+        and label.get("state") == "Suggested"
+    )
+
+
+def _markup_of(column: dict[str, Any]) -> tuple[ExistingTag | None, int | None]:
+    """A column's PII markup in the neutral shape, plus the slot of the managed label.
+
+    *Managed* (ADR-0006 A1) iff the marker is present AND the PII label itself
+    is ``Automated`` + ``Suggested``; a steward's confirmation or a foreign
+    label moves it into human authority. The returned slot is that label's
+    index in ``tags`` — the only label a write may ever replace. Otherwise any
+    PII label makes the markup human (sensitive wins among several).
     """
     fqns = _tag_fqns(column)
-    if _PII_SENSITIVE in fqns:
-        sensitive = True
-    elif _PII_NON_SENSITIVE in fqns:
-        sensitive = False
-    else:
-        return None
-    return ExistingTag(
-        tag=PiiTag(category="pii", sensitive=sensitive), managed=MARKER_TAG in fqns
-    )
+    tags = column.get("tags") or []
+    pii_slots = [i for i, fqn in enumerate(fqns) if fqn in _PII_FQNS]
+    if not pii_slots:
+        return None, None
+    if MARKER_TAG in fqns:
+        for slot in pii_slots:
+            if _is_unconfirmed_automated(tags[slot]):
+                return ExistingTag(sensitive=fqns[slot] == _PII_SENSITIVE, managed=True), slot
+    sensitive = any(fqns[i] == _PII_SENSITIVE for i in pii_slots)
+    return ExistingTag(sensitive=sensitive, managed=False), None
+
+
+def _existing_tag(column: dict[str, Any]) -> ExistingTag | None:
+    return _markup_of(column)[0]
+
+
+def _is_patch_test_failure(response: Any) -> bool:
+    """A 400 whose message says a JSON Patch ``test`` operation failed.
+
+    The pinned column name or label no longer matches: the table changed
+    between the re-fetch and the PATCH. Any other 400 is a real error.
+    """
+    if response.status_code != 400:
+        return False
+    try:
+        message = response.json().get("message", "")
+    except (ValueError, AttributeError):
+        return False
+    return isinstance(message, str) and "test" in message.lower()
 
 
 def _tag_label(tag_fqn: str) -> dict[str, str]:
@@ -152,50 +209,60 @@ def _group_by_node(changes: Sequence[TagChange]) -> dict[str, list[TagChange]]:
     return grouped
 
 
-def _plan_patch(
-    table: dict[str, Any], changes: list[TagChange]
-) -> tuple[list[dict[str, Any]], list[TagChange], list[tuple[TagChange, str]]]:
-    """JSON Patch operations for one table, verified against its live state.
+@dataclass
+class _PatchPlan:
+    ops: list[dict[str, Any]] = field(default_factory=list)
+    patched: list[TagChange] = field(default_factory=list)
+    skipped: list[tuple[TagChange, str]] = field(default_factory=list)
 
-    Returns ``(operations, patched changes, skipped changes with reasons)``.
+
+def _plan_patch(table: dict[str, Any], changes: list[TagChange]) -> _PatchPlan:
+    """JSON Patch operations for one table, re-verified against its live state.
+
+    Each change is re-classified by the core policy against the freshly
+    fetched column; only ``add``/``update`` verdicts produce operations, the
+    rest are skipped with the reason. Every touched column is pinned by a
+    ``test`` on its name (and, on ``replace``, on the label being replaced), so
+    a concurrent reordering fails the patch instead of tagging the wrong column.
     """
     columns = table.get("columns") or []
-    index_of = {
-        name.lower(): position
-        for position, column in enumerate(columns)
-        if isinstance(column, dict) and isinstance(name := column.get("name"), str)
-    }
-    ops: list[dict[str, Any]] = []
-    patched: list[TagChange] = []
-    skipped: list[tuple[TagChange, str]] = []
+    index_of: dict[str, int] = {}
+    for position, column in enumerate(columns):
+        name = column.get("name") if isinstance(column, dict) else None
+        if isinstance(name, str):
+            index_of.setdefault(name.lower(), position)
+    plan = _PatchPlan()
+    pinned: set[int] = set()
     for change in changes:
-        position = index_of.get(change.column.lower())
-        if position is None:
-            skipped.append((change, "skipped: column no longer exists in the table"))
+        at = index_of.get(change.column.lower())
+        if at is None:
+            plan.skipped.append((change, "skipped: column no longer exists in the table"))
             continue
-        column = columns[position]
-        live = _existing_tag(column)
+        column = columns[at]
+        live, slot = _markup_of(column)
+        verdict = reclassify_change(change, live)
+        if verdict.action not in ("add", "update"):
+            plan.skipped.append((change, f"skipped: {recheck_reason(verdict)}"))
+            continue
+        if at not in pinned:
+            pinned.add(at)
+            plan.ops.append({"op": "test", "path": f"/columns/{at}/name", "value": column["name"]})
+        base = f"/columns/{at}/tags"
         label = _tag_label(_PII_SENSITIVE if change.tag.sensitive else _PII_NON_SENSITIVE)
-        base = f"/columns/{position}/tags"
-        if live is not None and not live.managed:
-            skipped.append((change, "skipped: a human-placed PII tag appeared since the diff"))
-        elif live is not None and live.tag.sensitive == change.tag.sensitive:
-            skipped.append((change, "skipped: the column already carries this managed tag"))
-        elif live is not None:
-            fqns = _tag_fqns(column)
-            slot = next(i for i, fqn in enumerate(fqns) if fqn in _PII_FQNS)
-            ops.append({"op": "replace", "path": f"{base}/{slot}", "value": label})
-            patched.append(change)
+        if verdict.action == "update" and slot is not None:
+            old = _tag_fqns(column)[slot]
+            plan.ops.append({"op": "test", "path": f"{base}/{slot}/tagFQN", "value": old})
+            plan.ops.append({"op": "replace", "path": f"{base}/{slot}", "value": label})
         else:
             labels = [label]
             if MARKER_TAG not in _tag_fqns(column):
                 labels.append(_tag_label(MARKER_TAG))
             if isinstance(column.get("tags"), list):
-                ops.extend({"op": "add", "path": f"{base}/-", "value": lbl} for lbl in labels)
+                plan.ops.extend({"op": "add", "path": f"{base}/-", "value": lbl} for lbl in labels)
             else:
-                ops.append({"op": "add", "path": base, "value": labels})
-            patched.append(change)
-    return ops, patched, skipped
+                plan.ops.append({"op": "add", "path": base, "value": labels})
+        plan.patched.append(change)
+    return plan
 
 
 def _has_userinfo(host: str) -> bool:
@@ -235,6 +302,7 @@ class OpenMetadataSource:
             )
         self.host = host.rstrip("/")
         self._token = jwt_token
+        self._unsafe_names: set[str] = set()  # catalog names skipped during one build_graph
         self._timeout = timeout
         self._transport = transport  # injection point for tests (MockTransport)
 
@@ -255,21 +323,35 @@ class OpenMetadataSource:
 
     def build_graph(self, selection: GraphSelection | None = None) -> LineageGraph:
         client = self._open_client()
+        self._unsafe_names = set()
         try:
             if selection is None or selection.is_full_scan():
-                return self._full_scan(client)
-            return self._walk(
-                client,
-                self._resolve_selection(client, selection),
-                selection.upstream_depth,
-                selection.downstream_depth,
-            )
+                graph = self._full_scan(client)
+            else:
+                graph = self._walk(
+                    client,
+                    self._resolve_selection(client, selection),
+                    selection.upstream_depth,
+                    selection.downstream_depth,
+                )
         finally:
             client.close()
+        if self._unsafe_names:
+            # Count only: the names are hostile input and are not echoed.
+            graph.warnings.append(
+                f"skipped {len(self._unsafe_names)} catalog entries whose names are unsafe "
+                "or inconsistent; their lineage was not analyzed"
+            )
+        return graph
 
-    def _resolve_selection(
-        self, client: httpx.Client, selection: GraphSelection
-    ) -> list[str]:
+    def _usable(self, fqn: str) -> bool:
+        """Whether a catalog-supplied FQN may be used in a URL; remembers rejects (A7)."""
+        if _unsafe_fqn(fqn):
+            self._unsafe_names.add(fqn)
+            return False
+        return True
+
+    def _resolve_selection(self, client: httpx.Client, selection: GraphSelection) -> list[str]:
         """Resolve the selection to concrete root FQNs (ADR-0002 amendment A5).
 
         Exact roots keep the listing-free path. Patterns and from-seeds cost
@@ -279,35 +361,39 @@ class OpenMetadataSource:
         """
         if selection.from_seeds:
             tables = self._list_tables(client, fields="columns,tags")
-            seeded = sorted(
-                table["fullyQualifiedName"] for table in tables if _declared_pii(table)
-            )
+            seeded = sorted(table["fullyQualifiedName"] for table in tables if _declared_pii(table))
             if not seeded:
                 raise SensiflowInputError(
                     f"--roots-from-seeds found no PII-tagged tables at {self.host}; "
                     "sensiflow needs declared PII markup to trace from "
                     "(ADR-0001 applicability precondition)"
                 )
-            return seeded
+            return [fqn for fqn in seeded if self._usable(fqn)]
+        for root in selection.roots:
+            if _unsafe_fqn(root):
+                raise SensiflowInputError(
+                    "a --root value contains characters that are not valid in a catalog name"
+                )
         resolved = list(selection.roots)
         if selection.patterns:
             candidates = [
                 (table["fullyQualifiedName"], table.get("name") or "")
                 for table in self._list_tables(client, fields=None)
             ]
-            resolved.extend(resolve_patterns(selection.patterns, candidates))
+            matched = resolve_patterns(selection.patterns, candidates)
+            resolved.extend(fqn for fqn in matched if self._usable(fqn))
         # One node matched by several selectors appears once (A2).
         return list(dict.fromkeys(resolved))
 
     # -- WritebackTarget (ADR-0006 §3, §5) ------------------------------------
 
     def read_markup(self, node_ids: Sequence[str]) -> dict[tuple[str, str], ExistingTag]:
-        """PII markup per column; managed iff the sensiflow marker is present."""
+        """PII markup per column; managed per ADR-0006 A1 (see :func:`_markup_of`)."""
         client = self._open_client()
         try:
             markup: dict[tuple[str, str], ExistingTag] = {}
             for fqn in node_ids:
-                table = self._fetch_markup_table(client, fqn)
+                table, _ = self._fetch_markup_table(client, fqn)
                 for name, column in _columns_of(table or {}):
                     existing = _existing_tag(column)
                     if existing is not None:
@@ -317,22 +403,21 @@ class OpenMetadataSource:
             client.close()
 
     def find_unmatched(self, changes: Sequence[TagChange]) -> dict[tuple[str, str], str]:
-        """Planned columns missing from the live table schema (e.g. JOIN-only findings)."""
+        """Planned columns the live table cannot place (physical placement only, A6)."""
         client = self._open_client()
         try:
             unmatched: dict[tuple[str, str], str] = {}
             for fqn, node_changes in _group_by_node(changes).items():
-                table = self._fetch_markup_table(client, fqn)
+                table, _ = self._fetch_markup_table(client, fqn)
                 names = {name.lower() for name, _ in _columns_of(table or {})}
                 for change in node_changes:
                     key = (fqn, change.column.lower())
-                    if table is None:
+                    if _unsafe_fqn(fqn):
+                        unmatched[key] = "node name is not safe to address in the catalog API"
+                    elif table is None:
                         unmatched[key] = "table not found in OpenMetadata"
                     elif key[1] not in names:
-                        unmatched[key] = (
-                            "column is not in the table's schema in OpenMetadata "
-                            "(e.g. referenced only in JOIN/WHERE)"
-                        )
+                        unmatched[key] = "column is not in the table's schema in OpenMetadata"
             return unmatched
         finally:
             client.close()
@@ -340,32 +425,53 @@ class OpenMetadataSource:
     def write_changes(self, changes: Sequence[TagChange]) -> ApplyResult:
         """Append TagLabels with one JSON Patch per table, re-verified against live state.
 
-        The marker classification/tag is created idempotently first. A failed
-        PATCH fails only that table's changes; changes the live re-check
-        reclassifies (column gone, a human tag appeared) are skipped and
-        reported in ``failed`` with a ``skipped:`` message, never forced.
+        The marker classification/tag is created idempotently first. Changes the
+        live re-check reclassifies (column gone, a human tag appeared, the label
+        was confirmed, a concurrent edit) are *skipped* with the reason, never
+        forced; a failed PATCH *fails* only that table's changes (A3).
         """
         result = ApplyResult(applied=[], failed=[])
         if not changes:
             return result
         client = self._open_client()
+        ensured = False
+
+        def ensure_marker() -> None:
+            # Created lazily, right before the first PATCH that needs it: a run
+            # whose changes are all skipped never mutates the catalog at all.
+            nonlocal ensured
+            if not ensured:
+                self._ensure_marker(client)
+                ensured = True
+
         try:
-            self._ensure_marker(client)
             for fqn, table_changes in _group_by_node(changes).items():
-                self._patch_table(client, fqn, table_changes, result)
+                self._patch_table(client, fqn, table_changes, result, ensure_marker)
         finally:
             client.close()
         return result
 
-    def _fetch_markup_table(self, client: httpx.Client, fqn: str) -> dict[str, Any] | None:
-        """The table with ``fields=columns,tags``; ``None`` when it no longer exists."""
-        path = f"/tables/name/{fqn}"
+    def _fetch_markup_table(
+        self, client: httpx.Client, fqn: str
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        """The table (``fields=columns,tags``) and its ETag; ``(None, None)`` when absent.
+
+        Absent covers: an unsafe FQN (never sent), a 404, and a returned entity
+        whose own ``fullyQualifiedName`` is not the one requested — the plan
+        names exactly one table and nothing else may be read or patched (A7).
+        """
+        if _unsafe_fqn(fqn):
+            return None, None
+        path = _name_path("/tables", fqn)
         response = self._send(
             client, "GET", path, params={"fields": "columns,tags"}, tolerate=frozenset({404})
         )
         if response.status_code == 404:
-            return None
-        return self._json(response, path)
+            return None, None
+        table = self._json(response, path)
+        if table.get("fullyQualifiedName") != fqn:
+            return None, None
+        return table, response.headers.get("etag")
 
     def _ensure_marker(self, client: httpx.Client) -> None:
         """Create the Sensiflow classification and Propagated tag if absent (idempotent)."""
@@ -404,34 +510,54 @@ class OpenMetadataSource:
         fqn: str,
         changes: list[TagChange],
         result: ApplyResult,
+        ensure_marker: Callable[[], None],
     ) -> None:
+        def skip_all(reason: str) -> None:
+            result.skipped.extend((c, f"skipped: {reason}") for c in changes)
+
+        if _unsafe_fqn(fqn):
+            skip_all("node name is not safe to address in the catalog API")
+            return
         try:
             # Re-fetch right before patching: JSON Patch paths are index-based
             # and the plan may be minutes old (ADR-0006 §5).
-            table = self._fetch_markup_table(client, fqn)
-            if table is None:
-                result.failed.extend((c, "skipped: table no longer exists") for c in changes)
-                return
-            table_id = table.get("id")
-            if not isinstance(table_id, str) or not table_id:
-                result.failed.extend((c, "table entity has no id; cannot patch") for c in changes)
-                return
-            ops, patched, skipped = _plan_patch(table, changes)
-            result.failed.extend(skipped)
-            if ops:
-                self._request(
-                    client,
-                    "PATCH",
-                    f"/tables/{table_id}",
-                    body=ops,
-                    content_type=_PATCH_CONTENT_TYPE,
-                )
+            table, etag = self._fetch_markup_table(client, fqn)
         except SensiflowConnectionError as exc:
-            # Only this table's not-yet-reported changes fail; other tables proceed.
-            reported = {id(change) for change, _ in result.failed}
-            result.failed.extend((c, str(exc)) for c in changes if id(c) not in reported)
+            result.failed.extend((c, str(exc)) for c in changes)
             return
-        result.applied.extend(patched)
+        if table is None:
+            skip_all("table no longer exists or does not match the requested name")
+            return
+        try:
+            table_id = str(uuid.UUID(str(table.get("id"))))
+        except ValueError:
+            skip_all("table entity has no valid id; cannot patch")
+            return
+        plan = _plan_patch(table, changes)
+        result.skipped.extend(plan.skipped)
+        if not plan.ops:
+            return
+        ensure_marker()  # a failure here aborts the run before any tag is written
+        try:
+            response = self._send(
+                client,
+                "PATCH",
+                f"/tables/{table_id}",
+                body=plan.ops,
+                content_type=_PATCH_CONTENT_TYPE,
+                headers={"If-Match": etag} if etag else None,
+                tolerate=frozenset({400, 412}),
+            )
+            if response.status_code == 412 or _is_patch_test_failure(response):
+                result.skipped.extend(
+                    (c, "skipped: table modified concurrently; re-run") for c in plan.patched
+                )
+                return
+            self._raise_for_status(response, f"/tables/{table_id}")
+        except SensiflowConnectionError as exc:
+            result.failed.extend((c, str(exc)) for c in plan.patched)
+            return
+        result.applied.extend(plan.patched)
 
     # -- graph construction (ADR-0002 §3) -----------------------------------
 
@@ -443,9 +569,7 @@ class OpenMetadataSource:
         downstream_depth: int | None,
     ) -> LineageGraph:
         cache: _EdgeCache = {}
-        ancestors, truncated_up = self._expand(
-            client, roots, upstream_depth, cache, direction=_UP
-        )
+        ancestors, truncated_up = self._expand(client, roots, upstream_depth, cache, direction=_UP)
         descendants, truncated_down = self._expand(
             client, roots, downstream_depth, cache, direction=_DOWN
         )
@@ -453,6 +577,8 @@ class OpenMetadataSource:
         nodes: dict[str, Node] = {}
         for fqn in sorted(set(roots) | ancestors | descendants):
             table = self._fetch_table(client, fqn)
+            if table is None:
+                continue
             upstream = list(self._edges(client, fqn, cache)[_UP])
             node = _node_from_table(table, upstream)
             nodes[node.id] = node
@@ -505,6 +631,8 @@ class OpenMetadataSource:
         nodes: dict[str, Node] = {}
         for table in tables:
             fqn = table["fullyQualifiedName"]
+            if not self._usable(fqn):
+                continue
             upstream = list(self._edges(client, fqn, cache)[_UP])
             node = _node_from_table(table, upstream)
             nodes[node.id] = node
@@ -512,9 +640,7 @@ class OpenMetadataSource:
 
     # -- OMD endpoints -------------------------------------------------------
 
-    def _list_tables(
-        self, client: httpx.Client, *, fields: str | None
-    ) -> list[dict[str, Any]]:
+    def _list_tables(self, client: httpx.Client, *, fields: str | None) -> list[dict[str, Any]]:
         """One paginated pass over /tables; ``fields=None`` keeps the payload light.
 
         The payload is untrusted: entries that are not mappings or lack a
@@ -540,10 +666,13 @@ class OpenMetadataSource:
                 break
         return tables
 
-    def _fetch_table(
-        self, client: httpx.Client, fqn: str, fields: str = _TABLE_FIELDS
-    ) -> dict[str, Any]:
-        return self._get(client, f"/tables/name/{fqn}", {"fields": fields})
+    def _fetch_table(self, client: httpx.Client, fqn: str) -> dict[str, Any] | None:
+        """The table entity, or ``None`` when it answers to a different name (A7)."""
+        table = self._get(client, _name_path("/tables", fqn), {"fields": _TABLE_FIELDS})
+        if table.get("fullyQualifiedName") != fqn:
+            self._unsafe_names.add(fqn)
+            return None
+        return table
 
     def _edges(
         self, client: httpx.Client, fqn: str, cache: _EdgeCache
@@ -552,7 +681,7 @@ class OpenMetadataSource:
             return cache[fqn]
         payload = self._get(
             client,
-            f"/lineage/table/name/{fqn}",
+            _name_path("/lineage/table", fqn),
             {"upstreamDepth": 1, "downstreamDepth": 1},
         )
         entity = payload.get("entity") or {}
@@ -571,14 +700,15 @@ class OpenMetadataSource:
             for edge in payload.get("downstreamEdges") or []
             if edge.get("fromEntity") == entity_id
         ]
-        cache[fqn] = ([u for u in ups if u], [d for d in downs if d])
+        cache[fqn] = (
+            [u for u in ups if isinstance(u, str) and self._usable(u)],
+            [d for d in downs if isinstance(d, str) and self._usable(d)],
+        )
         return cache[fqn]
 
     # -- transport with error mapping (ADR-0002 §5) --------------------------
 
-    def _get(
-        self, client: httpx.Client, path: str, params: dict[str, Any]
-    ) -> dict[str, Any]:
+    def _get(self, client: httpx.Client, path: str, params: dict[str, Any]) -> dict[str, Any]:
         return self._request(client, "GET", path, params=params)
 
     def _request(
@@ -598,11 +728,11 @@ class OpenMetadataSource:
 
     def _json(self, response: httpx.Response, path: str) -> dict[str, Any]:
         try:
-            data: dict[str, Any] = response.json()
+            data = response.json()
         except ValueError:
-            raise SensiflowConnectionError(
-                f"invalid JSON from {self.host} for {path}"
-            ) from None
+            raise SensiflowConnectionError(f"invalid JSON from {self.host} for {path}") from None
+        if not isinstance(data, dict):
+            raise SensiflowConnectionError(f"unexpected payload shape from {self.host} for {path}")
         return data
 
     def _send(
@@ -614,6 +744,7 @@ class OpenMetadataSource:
         params: dict[str, Any] | None = None,
         body: Any = None,
         content_type: str = "application/json",
+        headers: dict[str, str] | None = None,
         tolerate: frozenset[int] = frozenset(),
     ) -> httpx.Response:
         """One HTTP call with the shared error mapping.
@@ -632,7 +763,7 @@ class OpenMetadataSource:
                     path,
                     params=params,
                     content=json.dumps(body),
-                    headers={"Content-Type": content_type},
+                    headers={"Content-Type": content_type, **(headers or {})},
                 )
         except httpx_mod.HTTPError as exc:
             # `from None`: httpx exceptions can embed the request (headers
@@ -640,8 +771,11 @@ class OpenMetadataSource:
             raise SensiflowConnectionError(
                 f"cannot reach OpenMetadata at {self.host}: {type(exc).__name__}"
             ) from None
-        if response.status_code in tolerate:
-            return response
+        if response.status_code not in tolerate:
+            self._raise_for_status(response, path)
+        return response
+
+    def _raise_for_status(self, response: httpx.Response, path: str) -> None:
         if response.status_code == 401:
             raise SensiflowConnectionError(
                 f"authentication failed (401) at {self.host} — check the JWT token"
@@ -650,4 +784,3 @@ class OpenMetadataSource:
             raise SensiflowConnectionError(
                 f"OpenMetadata at {self.host} returned {response.status_code} for {path}"
             )
-        return response

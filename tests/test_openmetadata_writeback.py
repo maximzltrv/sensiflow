@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import copy
 import json
+from dataclasses import replace
 from typing import Any
 
 import httpx
@@ -18,8 +19,11 @@ import pytest
 
 from sensiflow import (
     ApplyResult,
+    GraphSelection,
     PiiTag,
+    Risk,
     SensiflowConnectionError,
+    SensiflowInputError,
     TagChange,
     apply_writeback,
     diff_writeback,
@@ -30,8 +34,10 @@ from sensiflow.sources.openmetadata import (
     MARKER_TAG,
     OpenMetadataSource,
     _declared_pii,
+    _markup_of,
+    _unsafe_fqn,
 )
-from tests.test_openmetadata import BY_FQN, PREFIX, TABLES, TOKEN, _lineage_payload
+from tests.support import BY_FQN, PREFIX, TOKEN, FakeOmd, label
 
 STG = f"{PREFIX}.stg_customers"
 DIM = f"{PREFIX}.dim_customers"
@@ -40,108 +46,10 @@ ENRICHED = f"{PREFIX}.mart_orders_enriched"
 EMAIL = PiiTag(category="email")
 
 
-def label(fqn: str) -> dict[str, str]:
-    return {
-        "tagFQN": fqn,
-        "source": "Classification",
-        "labelType": "Automated",
-        "state": "Suggested",
-    }
-
-
-def apply_json_patch(document: dict[str, Any], ops: list[dict[str, Any]]) -> None:
-    for op in ops:
-        *parents, leaf = op["path"].strip("/").split("/")
-        target: Any = document
-        for part in parents:
-            target = target[int(part)] if isinstance(target, list) else target[part]
-        if isinstance(target, list):
-            if op["op"] == "add":
-                target.append(op["value"]) if leaf == "-" else target.insert(int(leaf), op["value"])
-            else:
-                assert op["op"] == "replace"
-                target[int(leaf)] = op["value"]
-        else:
-            target[leaf] = op["value"]
-
-
-class FakeOmd:
-    """Stateful OMD fake: tables, the Sensiflow classification/tag, a request log."""
-
-    def __init__(self) -> None:
-        self.tables = {t["fullyQualifiedName"]: copy.deepcopy(t) for t in TABLES}
-        self.classifications: set[str] = set()
-        self.tags: set[str] = set()
-        self.requests: list[httpx.Request] = []
-        self.fail_patch_for: set[str] = set()  # table ids answering 500
-        self.deny_create = False
-
-    @property
-    def patches(self) -> list[httpx.Request]:
-        return [r for r in self.requests if r.method == "PATCH"]
-
-    def source(self) -> OpenMetadataSource:
-        return OpenMetadataSource(
-            "http://omd.test", TOKEN, transport=httpx.MockTransport(self.handle)
-        )
-
-    def by_id(self, table_id: str) -> dict[str, Any]:
-        return next(t for t in self.tables.values() if t.get("id") == table_id)
-
-    def handle(self, request: httpx.Request) -> httpx.Response:
-        self.requests.append(request)
-        path = request.url.path.removeprefix("/api/v1")
-        if request.method == "GET":
-            return self.get(path)
-        if request.method == "POST":
-            if self.deny_create:
-                return httpx.Response(403, json={})
-            body = json.loads(request.content)
-            if path == "/classifications":
-                self.classifications.add(body["name"])
-            else:
-                self.tags.add(f"{body['classification']}.{body['name']}")
-            return httpx.Response(201, json=body)
-        assert request.method == "PATCH"
-        assert request.headers["content-type"] == "application/json-patch+json"
-        table = self.by_id(path.removeprefix("/tables/"))
-        if table["id"] in self.fail_patch_for:
-            return httpx.Response(500, json={"message": f"boom {TOKEN}"})
-        apply_json_patch(table, json.loads(request.content))
-        return httpx.Response(200, json=table)
-
-    def get(self, path: str) -> httpx.Response:
-        if path == "/tables":
-            return httpx.Response(200, json={"data": list(self.tables.values()), "paging": {}})
-        if path.startswith("/tables/name/"):
-            fqn = path.removeprefix("/tables/name/")
-            if fqn not in self.tables:
-                return httpx.Response(404, json={})
-            return httpx.Response(200, json=self.tables[fqn])
-        if path.startswith("/lineage/table/name/"):
-            return httpx.Response(
-                200, json=_lineage_payload(path.removeprefix("/lineage/table/name/"))
-            )
-        if path.startswith("/classifications/name/"):
-            known = path.removeprefix("/classifications/name/") in self.classifications
-            return httpx.Response(200 if known else 404, json={})
-        if path.startswith("/tags/name/"):
-            return httpx.Response(
-                200 if path.removeprefix("/tags/name/") in self.tags else 404, json={}
-            )
-        return httpx.Response(404, json={})
-
-    def column(self, fqn: str, name: str) -> dict[str, Any]:
-        return next(c for c in self.tables[fqn]["columns"] if c["name"] == name)
-
-    def tag_fqns(self, fqn: str, name: str) -> list[str]:
-        return [t["tagFQN"] for t in self.column(fqn, name)["tags"]]
-
-
-def run_plan(omd: FakeOmd, min_risk: str = "MEDIUM") -> tuple[OpenMetadataSource, Any]:
+def run_plan(omd: FakeOmd, min_risk: Risk = "MEDIUM") -> tuple[OpenMetadataSource, Any]:
     source = omd.source()
     result = trace(source.build_graph())
-    plan = plan_writeback(result, min_risk=min_risk)  # type: ignore[arg-type]
+    plan = plan_writeback(result, min_risk=min_risk)
     return source, diff_writeback(plan, source)
 
 
@@ -170,8 +78,8 @@ def test_read_markup_distinguishes_managed_from_human_by_the_marker() -> None:
     assert set(markup) == {(STG, "email"), (STG, "phone"), (STG, "full_name")}
     assert markup[(STG, "email")].managed is True
     assert markup[(STG, "phone")].managed is False
-    assert markup[(STG, "phone")].tag.sensitive is False
-    assert markup[(STG, "full_name")].tag.sensitive is True  # sensitive wins
+    assert markup[(STG, "phone")].sensitive is False
+    assert markup[(STG, "full_name")].sensitive is True  # sensitive wins
     fields = [r.url.params["fields"] for r in omd.requests]
     assert set(fields) == {"columns,tags"}
 
@@ -203,12 +111,32 @@ def test_apply_sends_one_json_patch_per_table_with_index_paths_and_labels() -> N
     stg_ops = json.loads(
         next(r for r in omd.patches if omd.tables[STG]["id"] in r.url.path).content
     )
-    paths = [op["path"] for op in stg_ops]
-    # stg columns: customer_id=0 email=1 phone=2 full_name=3; changes sort by column name
-    assert paths == [f"/columns/{i}/tags/-" for i in (1, 1, 3, 3, 2, 2)]
-    assert stg_ops[0] == {"op": "add", "path": "/columns/1/tags/-", "value": label("PII.Sensitive")}
-    assert stg_ops[1]["value"] == label(MARKER_TAG)
-    assert all(op["op"] == "add" for op in stg_ops)
+    assert {op["op"] for op in stg_ops} == {"test", "add"}  # nothing else may ever be sent
+    # stg columns: customer_id=0 email=1 phone=2 full_name=3; changes sort by column name.
+    # Each touched column is pinned by a name test before its first add.
+    assert [(op["op"], op["path"]) for op in stg_ops] == [
+        ("test", "/columns/1/name"),
+        ("add", "/columns/1/tags/-"),
+        ("add", "/columns/1/tags/-"),
+        ("test", "/columns/3/name"),
+        ("add", "/columns/3/tags/-"),
+        ("add", "/columns/3/tags/-"),
+        ("test", "/columns/2/name"),
+        ("add", "/columns/2/tags/-"),
+        ("add", "/columns/2/tags/-"),
+    ]
+    assert stg_ops[0]["value"] == "email"
+    assert stg_ops[1] == {"op": "add", "path": "/columns/1/tags/-", "value": label("PII.Sensitive")}
+    assert stg_ops[2]["value"] == label(MARKER_TAG)
+
+
+def test_patch_carries_the_etag_of_the_refetch_as_if_match() -> None:
+    omd = FakeOmd()
+    source, diff = run_plan(omd)
+    omd.versions[STG] = 7
+    apply_writeback(diff, source, confirm=True)
+    stg_patch = next(r for r in omd.patches if omd.tables[STG]["id"] in r.url.path)
+    assert stg_patch.headers["if-match"] == '"7"'
 
 
 def test_apply_end_to_end_state_and_convergence() -> None:
@@ -291,7 +219,8 @@ def test_indexes_are_computed_from_a_fresh_fetch_not_the_plan() -> None:
     assert not result.failed
     assert omd.tag_fqns(STG, "email") == ["PII.Sensitive", MARKER_TAG]
     ops = json.loads(next(r for r in omd.patches if omd.tables[STG]["id"] in r.url.path).content)
-    assert ops[0]["path"] == "/columns/2/tags/-"  # email moved from 1 to 2
+    assert ops[0] == {"op": "test", "path": "/columns/2/name", "value": "email"}
+    assert ops[1]["path"] == "/columns/2/tags/-"  # email moved from 1 to 2
 
 
 def test_changes_reclassified_by_the_recheck_are_skipped_and_reported() -> None:
@@ -303,8 +232,10 @@ def test_changes_reclassified_by_the_recheck_are_skipped_and_reported() -> None:
     ]  # and a column vanished
     result = apply_writeback(diff, source, confirm=True)
 
-    reasons = {(c.node_id.rsplit(".", 1)[1], c.column): msg for c, msg in result.failed}
-    assert "human-placed PII tag appeared" in reasons[("stg_customers", "email")]
+    assert result.failed == []  # nothing was attempted and broken: skips are not failures
+    reasons = {(c.node_id.rsplit(".", 1)[1], c.column): msg for c, msg in result.skipped}
+    assert "re-check found conflict" in reasons[("stg_customers", "email")]
+    assert "human-placed" in reasons[("stg_customers", "email")]
     assert "column no longer exists" in reasons[("stg_customers", "phone")]
     assert all(msg.startswith("skipped:") for msg in reasons.values())
     assert omd.tag_fqns(STG, "email") == ["PII.NonSensitive"]  # human tag never touched
@@ -312,13 +243,14 @@ def test_changes_reclassified_by_the_recheck_are_skipped_and_reported() -> None:
     assert omd.tag_fqns(DIM, "email") == ["PII.Sensitive", MARKER_TAG]
 
 
-def test_a_table_deleted_between_diff_and_apply_fails_only_its_changes() -> None:
+def test_a_table_deleted_between_diff_and_apply_skips_only_its_changes() -> None:
     omd = FakeOmd()
     source, diff = run_plan(omd)
     del omd.tables[STG]
     result = apply_writeback(diff, source, confirm=True)
-    assert {c.node_id for c, _ in result.failed} == {STG}
-    assert all("table no longer exists" in msg for _, msg in result.failed)
+    assert result.failed == []
+    assert {c.node_id for c, _ in result.skipped} == {STG}
+    assert all("table no longer exists" in msg for _, msg in result.skipped)
     assert {c.node_id for c in result.applied} == {DIM}
 
 
@@ -327,8 +259,9 @@ def test_already_managed_tag_found_by_the_recheck_is_skipped_not_duplicated() ->
     source, diff = run_plan(omd)
     omd.column(DIM, "email")["tags"] = [label("PII.Sensitive"), label(MARKER_TAG)]
     result = apply_writeback(diff, source, confirm=True)
-    skipped = [c for c, msg in result.failed if "already carries" in msg]
+    skipped = [c for c, msg in result.skipped if "re-check found unchanged" in msg]
     assert [(c.node_id, c.column) for c in skipped] == [(DIM, "email")]
+    assert result.failed == []
     assert omd.tag_fqns(DIM, "email") == ["PII.Sensitive", MARKER_TAG]
 
 
@@ -354,7 +287,7 @@ def test_column_without_a_tags_array_gets_one_created() -> None:
     source, diff = run_plan(omd)
     apply_writeback(diff, source, confirm=True)
     ops = json.loads(next(r for r in omd.patches if omd.tables[STG]["id"] in r.url.path).content)
-    first = ops[0]
+    first = next(op for op in ops if op["op"] == "add")
     assert first["path"] == "/columns/1/tags"
     assert first["value"] == [label("PII.Sensitive"), label(MARKER_TAG)]
     assert omd.tag_fqns(STG, "email") == ["PII.Sensitive", MARKER_TAG]
@@ -386,7 +319,8 @@ def test_join_only_high_finding_is_unmatched_with_a_reason() -> None:
     _, diff = run_plan(omd, "HIGH")
     [change] = diff.changes
     assert (change.node_id, change.column, change.action) == (ENRICHED, "email", "unmatched")
-    assert "not in the table's schema" in change.detail
+    assert "not part of the node's output" in change.detail
+    assert "add manually" not in change.detail  # no snippet may invite pasting a phantom column
     assert diff.pending == []
 
 
@@ -439,13 +373,15 @@ def test_write_changes_with_no_changes_does_no_io() -> None:
     assert omd.requests == []
 
 
-def test_table_entity_without_id_fails_its_changes() -> None:
+@pytest.mark.parametrize("bad_id", [None, "", "not-a-uuid", "../tables/other", 42])
+def test_table_entity_without_a_valid_uuid_is_skipped_never_patched(bad_id: object) -> None:
     omd = FakeOmd()
     source, diff = run_plan(omd)
-    del omd.tables[STG]["id"]
+    omd.tables[STG]["id"] = bad_id
     result = apply_writeback(diff, source, confirm=True)
-    assert {c.node_id for c, _ in result.failed} == {STG}
-    assert "no id" in result.failed[0][1]
+    assert {c.node_id for c, _ in result.skipped} == {STG}
+    assert "no valid id" in result.skipped[0][1]
+    assert {r.url.path for r in omd.patches} == {f"/api/v1/tables/{omd.tables[DIM]['id']}"}
     assert BY_FQN  # fixture sanity: other tables untouched
 
 
@@ -466,7 +402,7 @@ def test_malformed_catalog_entries_never_abort_markup_reading() -> None:
     assert not source.write_changes([change]).failed
     # indexes are positions in the raw payload, junk entries included
     ops = json.loads(omd.patches[0].content)
-    assert ops[0]["path"] == "/columns/3/tags"
+    assert [op["path"] for op in ops if op["op"] == "add"] == ["/columns/3/tags"]
 
 
 def test_cli_dry_run_and_apply_against_the_catalog(
@@ -488,9 +424,326 @@ def test_cli_dry_run_and_apply_against_the_catalog(
     omd.fail_patch_for.add(omd.tables[DIM]["id"])
     assert main([*base, "--apply", "--yes"]) == 3
     captured = capsys.readouterr()
-    assert "result: APPLIED — 3 applied, 2 failed" in captured.out
+    assert "result: PARTIAL — 3 applied, 0 skipped, 2 failed" in captured.out
     assert TOKEN not in captured.out + captured.err
 
     omd.fail_patch_for.clear()
     assert main([*base, "--apply", "--yes"]) == 0
-    assert "result: APPLIED — 2 applied, 0 failed" in capsys.readouterr().out
+    assert "result: APPLIED — 2 applied, 0 skipped, 0 failed" in capsys.readouterr().out
+
+
+# --- A1: managed needs the marker AND an unconfirmed Automated label ----------------------------
+
+
+def _tag(fqn: str, label_type: str | None = "Automated", state: str | None = "Suggested") -> Any:
+    tag: dict[str, Any] = {"tagFQN": fqn, "source": "Classification"}
+    if label_type is not None:
+        tag["labelType"] = label_type
+    if state is not None:
+        tag["state"] = state
+    return tag
+
+
+@pytest.mark.parametrize(
+    ("tags", "managed"),
+    [
+        ([_tag("PII.Sensitive"), _tag(MARKER_TAG)], True),
+        ([_tag("PII.Sensitive", "Automated", "Confirmed"), _tag(MARKER_TAG)], False),
+        ([_tag("PII.Sensitive", "Manual", "Confirmed"), _tag(MARKER_TAG)], False),
+        ([_tag("PII.Sensitive", "Manual", "Suggested"), _tag(MARKER_TAG)], False),
+        ([_tag("PII.Sensitive", "Propagated", "Suggested"), _tag(MARKER_TAG)], False),
+        ([_tag("PII.Sensitive", None, None), _tag(MARKER_TAG)], False),
+        ([_tag("PII.Sensitive")], False),  # Automated + Suggested but no marker: not ours
+    ],
+)
+def test_managed_is_marker_plus_unconfirmed_automated_label(tags: list[Any], managed: bool) -> None:
+    existing, slot = _markup_of({"name": "email", "tags": tags})
+    assert existing is not None
+    assert existing.managed is managed
+    assert (slot is not None) is managed
+
+
+def test_a_steward_confirmed_label_is_never_updated_or_replaced() -> None:
+    omd = FakeOmd()
+    confirmed = _tag("PII.NonSensitive", "Automated", "Confirmed")
+    omd.column(STG, "email")["tags"] = [confirmed, label(MARKER_TAG)]
+    source, diff = run_plan(omd)
+    email = next(c for c in diff.changes if (c.node_id, c.column) == (STG, "email"))
+    assert email.action == "conflict"  # derived sensitive vs the human-ratified non-sensitive
+    apply_writeback(diff, source, confirm=True)
+    assert omd.column(STG, "email")["tags"] == [confirmed, label(MARKER_TAG)]
+
+
+def test_marker_spoofed_next_to_a_human_label_does_not_grant_authority() -> None:
+    omd = FakeOmd()
+    human = _tag("PII.Sensitive", "Manual", "Confirmed")
+    omd.column(STG, "email")["tags"] = [human, label(MARKER_TAG)]
+    _, diff = run_plan(omd)
+    email = next(c for c in diff.changes if (c.node_id, c.column) == (STG, "email"))
+    assert email.action == "manual"
+    assert not any(c.action == "update" for c in diff.changes)
+
+
+# --- A2: the tool never reduces protection on its own -------------------------------------------
+
+
+def test_managed_sensitive_label_is_not_downgraded_by_a_non_sensitive_derivation() -> None:
+    omd = FakeOmd()
+    omd.column(STG, "email")["tags"] = [label("PII.Sensitive"), label(MARKER_TAG)]
+    source = omd.source()
+    plan = plan_writeback(trace(source.build_graph()), min_risk="LOW")
+    # Same finding, but now derived non-sensitive.
+    flipped = [replace(c, tag=PiiTag(c.tag.category, False)) for c in plan.changes]
+    plan.changes[:] = flipped
+    diff = diff_writeback(plan, source)
+    email = next(c for c in diff.changes if (c.node_id, c.column) == (STG, "email"))
+    assert email.action == "conflict"
+    assert "downgrade withheld" in email.detail
+    apply_writeback(diff, source, confirm=True)
+    assert omd.tag_fqns(STG, "email") == ["PII.Sensitive", MARKER_TAG]
+
+
+def test_a_downgrade_that_appears_between_diff_and_apply_is_skipped_live() -> None:
+    omd = FakeOmd()
+    source = omd.source()
+    change = TagChange(STG, "stg_customers", "email", PiiTag("email", False), "MEDIUM", 0.9, "raw")
+    omd.column(STG, "email")["tags"] = [label("PII.Sensitive"), label(MARKER_TAG)]  # after the diff
+    result = source.write_changes([change])
+    assert result.applied == [] and result.failed == []
+    assert "downgrade withheld" in result.skipped[0][1]
+    assert omd.patches == []
+
+
+# --- A7: hostile identifiers ---------------------------------------------------------------------
+
+HOSTILE = [
+    "svc.a#b",
+    "svc.a?x=1",
+    "..",
+    "svc.a..b",
+    "svc.a%2e%2e",
+    "svc.a%2Fb",
+    "svc.a/b",
+    "svc.a\\b",
+    "svc.a;b",
+    "svc.a\nb",
+    "svc.a\x00b",
+    "svc.a\x7fb",
+    "",
+]
+
+
+@pytest.mark.parametrize("fqn", HOSTILE)
+def test_unsafe_fqns_are_recognised(fqn: str) -> None:
+    assert _unsafe_fqn(fqn)
+
+
+@pytest.mark.parametrize(
+    "fqn", [f"{PREFIX}.stg_customers", 'svc."db.name".schema.tbl', "svc.db.sch.t-1_x", "svc.é.t"]
+)
+def test_ordinary_fqns_are_safe(fqn: str) -> None:
+    assert not _unsafe_fqn(fqn)
+
+
+@pytest.mark.parametrize("fqn", HOSTILE)
+def test_write_path_never_sends_a_request_for_an_unsafe_fqn(fqn: str) -> None:
+    omd = FakeOmd()
+    source = omd.source()
+    change = TagChange(fqn, "t", "email", EMAIL, "MEDIUM", 0.9, "raw")
+    assert source.read_markup([fqn]) == {}
+    assert "not safe" in source.find_unmatched([change])[(fqn, "email")]
+    result = source.write_changes([change])
+    assert result.applied == [] and result.failed == []
+    assert "not safe" in result.skipped[0][1]
+    assert omd.requests == []  # no GET, no marker creation, nothing
+
+
+@pytest.mark.parametrize("fqn", [h for h in HOSTILE if h])
+def test_hostile_lineage_neighbours_are_skipped_with_a_warning(fqn: str) -> None:
+    omd = FakeOmd()
+    original = omd.get
+
+    def get(path: str) -> httpx.Response:
+        response = original(path)
+        if path.startswith("/lineage/table/name/") and path.endswith("stg_customers"):
+            payload = json.loads(response.content)
+            payload["nodes"].append({"id": "evil-id", "fullyQualifiedName": fqn})
+            payload["downstreamEdges"].append(
+                {"fromEntity": payload["entity"]["id"], "toEntity": "evil-id"}
+            )
+            return httpx.Response(200, json=payload)
+        return response
+
+    omd.get = get  # type: ignore[method-assign]  # test seam: wrap the fake's GET handler
+    graph = omd.source().build_graph(GraphSelection(roots=(STG,), upstream_depth=0))
+    assert fqn not in graph.nodes
+    assert any(w.startswith("skipped 1 catalog entries") for w in graph.warnings)
+    assert all(fqn not in str(r.url) for r in omd.requests)
+    assert STG in graph.nodes  # the rest of the run is unaffected
+
+
+def test_a_hostile_name_in_the_full_scan_listing_is_skipped_not_fatal() -> None:
+    omd = FakeOmd()
+    hostile = copy.deepcopy(omd.tables[STG])
+    hostile["fullyQualifiedName"] = "svc.a/b"
+    omd.tables["svc.a/b"] = hostile
+    graph = omd.source().build_graph()
+    assert "svc.a/b" not in graph.nodes
+    assert STG in graph.nodes
+    assert any("skipped 1 catalog entries" in w for w in graph.warnings)
+
+
+def test_a_hostile_explicit_root_is_a_usage_error_without_any_request() -> None:
+    omd = FakeOmd()
+    with pytest.raises(SensiflowInputError, match="not valid in a catalog name"):
+        omd.source().build_graph(GraphSelection(roots=("svc.a/../b",)))
+    assert omd.requests == []
+
+
+def test_hostile_names_found_by_patterns_or_seeds_are_dropped_with_a_warning() -> None:
+    omd = FakeOmd()
+    hostile = copy.deepcopy(omd.tables[STG])
+    hostile["fullyQualifiedName"] = "svc.a#b"
+    hostile["name"] = "stg_evil"
+    omd.tables["svc.a#b"] = hostile
+    graph = omd.source().build_graph(GraphSelection(patterns=("stg_*",), upstream_depth=0))
+    assert "svc.a#b" not in graph.nodes
+    assert any("skipped 1 catalog entries" in w for w in graph.warnings)
+    seeded = omd.source().build_graph(GraphSelection(from_seeds=True))
+    assert "svc.a#b" not in seeded.nodes
+
+
+def test_fqns_are_percent_encoded_in_every_name_url() -> None:
+    omd = FakeOmd()
+    quoted = 'svc."db.name".sch.tbl'
+    table = copy.deepcopy(omd.tables[STG])
+    table.update(fullyQualifiedName=quoted, id="00000000-0000-0000-0000-0000000000aa")
+    omd.tables[quoted] = table
+    omd.column(quoted, "email")["tags"] = [label("PII.Sensitive")]
+    assert omd.source().read_markup([quoted])
+    raw = [r.url.raw_path for r in omd.requests]
+    assert raw == [b"/api/v1/tables/name/svc.%22db.name%22.sch.tbl?fields=columns%2Ctags"]
+
+
+def test_an_entity_answering_to_another_name_is_never_used() -> None:
+    omd = FakeOmd()
+    original = omd.get
+
+    def get(path: str) -> httpx.Response:
+        if path == f"/tables/name/{STG}":
+            return original(f"/tables/name/{DIM}")  # the server returns a different table
+        return original(path)
+
+    omd.get = get  # type: ignore[method-assign]  # test seam: wrap the fake's GET handler
+    source = omd.source()
+    assert source.read_markup([STG]) == {}
+    change = TagChange(STG, "stg_customers", "email", EMAIL, "MEDIUM", 0.9, "raw")
+    assert source.find_unmatched([change])[(STG, "email")] == "table not found in OpenMetadata"
+    result = source.write_changes([change])
+    assert "does not match the requested name" in result.skipped[0][1]
+    assert omd.patches == []
+    graph = source.build_graph(GraphSelection(roots=(STG,), upstream_depth=0, downstream_depth=0))
+    assert STG not in graph.nodes
+    assert any("skipped 1 catalog entries" in w for w in graph.warnings)
+
+
+# --- concurrent modification: test ops, If-Match, 412 ------------------------------------------
+
+
+def test_a_concurrent_edit_makes_the_if_match_fail_and_skips_the_table() -> None:
+    omd = FakeOmd()
+    source, diff = run_plan(omd)
+    omd.edit_during_patch.add(omd.tables[STG]["id"])
+    result = apply_writeback(diff, source, confirm=True)
+    assert result.failed == []
+    assert {c.node_id for c, _ in result.skipped} == {STG}
+    assert all("modified concurrently; re-run" in msg for _, msg in result.skipped)
+    assert {c.node_id for c in result.applied} == {DIM}
+    assert omd.tag_fqns(STG, "email") == []  # nothing was written to the raced table
+
+
+def test_a_failed_patch_test_operation_skips_the_tables_changes() -> None:
+    omd = FakeOmd()
+    _, diff = run_plan(omd)
+    original = omd.handle
+
+    def reorder_before_patch(request: httpx.Request) -> httpx.Response:
+        if request.method == "PATCH" and omd.tables[STG]["id"] in request.url.path:
+            omd.tables[STG]["columns"].reverse()  # the name tests no longer match; no ETag help
+            request = httpx.Request(
+                "PATCH",
+                request.url,
+                content=request.content,
+                headers={"content-type": "application/json-patch+json"},
+            )
+        return original(request)
+
+    flaky = OpenMetadataSource(
+        "http://omd.test", TOKEN, transport=httpx.MockTransport(reorder_before_patch)
+    )
+    result = apply_writeback(diff, flaky, confirm=True)
+    assert result.failed == []
+    assert {c.node_id for c, _ in result.skipped} == {STG}
+    assert all("modified concurrently" in msg for _, msg in result.skipped)
+
+
+def test_replace_operations_pin_the_label_they_replace() -> None:
+    omd = FakeOmd()
+    omd.column(STG, "email")["tags"] = [label(MARKER_TAG), label("PII.NonSensitive")]
+    source, diff = run_plan(omd)
+    apply_writeback(diff, source, confirm=True)
+    ops = json.loads(next(r for r in omd.patches if omd.tables[STG]["id"] in r.url.path).content)
+    tests = [op for op in ops if op["op"] == "test"]
+    assert {"op": "test", "path": "/columns/1/tags/1/tagFQN", "value": "PII.NonSensitive"} in tests
+    assert {"op": "test", "path": "/columns/1/name", "value": "email"} in tests
+
+
+def test_a_400_that_is_not_a_test_failure_is_a_real_failure() -> None:
+    omd = FakeOmd()
+    _, diff = run_plan(omd)
+    original = omd.handle
+
+    def bad_request(request: httpx.Request) -> httpx.Response:
+        if request.method == "PATCH":
+            return httpx.Response(400, json={"message": "malformed patch"})
+        return original(request)
+
+    broken = OpenMetadataSource(
+        "http://omd.test", TOKEN, transport=httpx.MockTransport(bad_request)
+    )
+    result = apply_writeback(diff, broken, confirm=True)
+    assert result.skipped == []
+    assert len(result.failed) == len(diff.pending)
+    assert all("returned 400" in msg for _, msg in result.failed)
+
+
+# --- skip-only runs mutate nothing; hostile payload shapes --------------------------------------
+
+
+def test_a_run_whose_changes_are_all_skipped_never_creates_the_marker() -> None:
+    omd = FakeOmd()
+    source, diff = run_plan(omd)
+    omd.tables.clear()
+    result = apply_writeback(diff, source, confirm=True)
+    assert result.applied == [] and result.failed == []
+    assert len(result.skipped) == len(diff.pending)
+    assert not [r for r in omd.requests if r.method in ("POST", "PATCH")]
+
+
+def test_a_non_object_payload_is_a_clean_connection_error() -> None:
+    omd = FakeOmd()
+    original = omd.handle
+
+    def listy(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and "/tables/name/" in request.url.path:
+            return httpx.Response(200, json=["not", "an", "object"])
+        return original(request)
+
+    source = OpenMetadataSource("http://omd.test", TOKEN, transport=httpx.MockTransport(listy))
+    with pytest.raises(SensiflowConnectionError, match="unexpected payload shape"):
+        source.read_markup([STG])
+    change = TagChange(STG, "stg_customers", "email", EMAIL, "MEDIUM", 0.9, "raw")
+    result = source.write_changes([change])
+    assert [m for _, m in result.failed] == [
+        f"unexpected payload shape from http://omd.test for /tables/name/{STG}"
+    ]
