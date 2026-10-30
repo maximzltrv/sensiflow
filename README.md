@@ -96,11 +96,13 @@ and `OMD_TOKEN`) is `503`, and catalog-side failures never echo the catalog addr
 ### Docker
 
 The image runs the server by default and doubles as a containerized CLI. Tag it
-with the package version. Its healthcheck probes port 8000 (the default `CMD`); if
+with the package version; build it with `scripts/docker-build.sh`, which uses the
+committed tree as the build context (a plain `docker build .` would also ship
+untracked files under `src/`). Its healthcheck probes port 8000 (the default `CMD`); if
 you start the server on another port, override the healthcheck as well:
 
 ```bash
-docker build -t sensiflow:0.1.0 .
+scripts/docker-build.sh   # builds sensiflow:<version> from a clean `git archive HEAD`
 
 # server mode
 docker run --rm -p 8000:8000 \
