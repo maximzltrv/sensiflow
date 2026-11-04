@@ -8,7 +8,7 @@ node degrades to presence-based classification (LOW).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from sensiflow.exceptions import SensiflowInputError
 from sensiflow.model import Finding, LineageGraph, NodeResult, PiiTag, TraceResult
@@ -181,6 +181,13 @@ def trace(
             # Inherited columns that are neither projected, nor in JOIN/WHERE,
             # nor swept up by SELECT * are read-and-dropped: no finding, no
             # propagation.
+
+        # A JOIN/WHERE finding whose column never reaches the node's output has
+        # nothing a catalog could tag (write-back reads this, ADR-0006 A6).
+        for column in analysis.join_or_where if analysis is not None else ():
+            finding = findings.get(column)
+            if finding is not None and finding.risk == "HIGH" and column not in node_out:
+                findings[column] = replace(finding, in_output=False)
 
         outputs[node_id] = node_out
         results[node_id] = NodeResult(

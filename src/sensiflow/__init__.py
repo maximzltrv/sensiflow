@@ -18,11 +18,24 @@ from sensiflow.model import (
     TraceResult,
 )
 from sensiflow.root_selectors import GraphSelection
+from sensiflow.sources.base import ExistingTag, WritebackTarget
+from sensiflow.writeback import (
+    ApplyResult,
+    TagChange,
+    TagPlan,
+    WritebackAction,
+    WritebackDiff,
+    apply_writeback,
+    diff_writeback,
+    plan_writeback,
+)
 
 __version__ = "0.1.0"
 
 __all__ = [
     "DEFAULT_GENERIC_COLUMNS",
+    "ApplyResult",
+    "ExistingTag",
     "Finding",
     "GateOutcome",
     "GateRisk",
@@ -36,8 +49,16 @@ __all__ = [
     "SensiflowDependencyError",
     "SensiflowError",
     "SensiflowInputError",
+    "TagChange",
+    "TagPlan",
     "TraceResult",
+    "WritebackAction",
+    "WritebackDiff",
+    "WritebackTarget",
     "__version__",
+    "apply_writeback",
+    "diff_writeback",
     "evaluate_gate",
+    "plan_writeback",
     "trace",
 ]

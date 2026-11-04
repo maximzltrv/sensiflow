@@ -25,8 +25,10 @@ from sensiflow.cli import main
 from sensiflow.root_selectors import load_roots_file
 from sensiflow.sources.dbt import DbtSource
 from sensiflow.sources.mock import MockSource
+from tests.support import PREFIX, TABLES
+from tests.support import lineage_payload as _lineage_payload
 from tests.test_dbt import DIM, DUMP, MANIFEST, RAW_CUSTOMERS, STG
-from tests.test_openmetadata import PAGE_SIZE, PREFIX, TABLES, _lineage_payload, make_source
+from tests.test_openmetadata import PAGE_SIZE, make_source
 
 
 def dbt_source() -> DbtSource:

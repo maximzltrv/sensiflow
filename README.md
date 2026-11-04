@@ -35,6 +35,7 @@ Where it is not, classification degrades gracefully to presence-based analysis.
 ```bash
 pip install sensiflow                     # core
 pip install 'sensiflow[openmetadata]'     # + OpenMetadata connector
+pip install 'sensiflow[dbt]'              # + dbt write-back (comment-preserving YAML edits)
 ```
 
 ## Usage
@@ -55,12 +56,23 @@ The CLI is a thin wrapper over the same API:
 sensiflow report    --omd-host $OMD_HOST --omd-token $OMD_TOKEN --format text
 sensiflow check     --omd-host $OMD_HOST --omd-token $OMD_TOKEN --fail-on HIGH
 sensiflow propagate --omd-host $OMD_HOST --omd-token $OMD_TOKEN --min-risk LOW --dry-run
+sensiflow propagate --source dbt --dbt-manifest target/manifest.json \
+                    --dbt-project-dir . --min-risk MEDIUM --apply --yes
 ```
 
 Connection details are always supplied at runtime, via flags or the `OMD_HOST` /
 `OMD_TOKEN` environment variables. Analysis is read-only; writing tags back to a
 catalog is a separate command that is dry-run by default and requires explicit
-confirmation to apply.
+confirmation to apply (`--apply --yes`).
+
+`propagate` writes the derived PII markup next to a sensiflow marker
+(`Sensiflow.Propagated` in OpenMetadata, `meta.sensiflow` in dbt properties files),
+so tool-written markup is distinguishable from yours and never re-seeds a later
+run. Markup you placed by hand is never overwritten: a contradicting tag is reported
+as a conflict and left alone. To adopt a propagated tag as your own declaration,
+remove its marker. For dbt, `--dbt-project-dir` is required: the properties YAML
+files, not the manifest, are read and edited; models without a properties entry are
+reported with a ready-to-paste snippet.
 
 ## Development
 

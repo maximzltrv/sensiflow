@@ -1,0 +1,34 @@
+version: 2
+
+models:
+  - name: dim_customers
+    description: Customers dimension
+    columns:
+      - name: customer_id
+      - name: email
+        meta:
+          owner: analytics
+          pii: true
+          pii_category: email
+          pii_sensitive: true
+          sensiflow:   # written by a previous run
+            propagated: true
+            risk: LOW
+            confidence: 0.1
+            origin: old.origin
+        description: Customer email
+      - name: segment
+
+  - name: mart_customer_dump
+    description: |
+      Dump of customers.
+      Block scalar, two lines.
+    columns:
+      - name: customer_id
+      # a human tagged these two by hand
+      - name: email
+        meta:
+          pii: true
+          pii_sensitive: false   # human says: not sensitive
+      - name: full_name
+        meta: {pii: true}

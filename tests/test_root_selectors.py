@@ -329,6 +329,15 @@ def test_safe_load_is_the_only_yaml_entry_point() -> None:
     loader_text = sources[src_root / "root_selectors.py"]
     assert "safe_load" in loader_text
 
+    # The dbt write-back helper is the one sanctioned exception: ruamel's
+    # round-trip loader (typ="rt") only builds plain containers and scalars, and
+    # its ``.load(`` is the only way to parse. It is pinned to "rt" below.
+    round_trip = src_root / "sources" / "_dbt_yaml.py"
+    round_trip_text = sources.pop(round_trip)
+    assert 'typ="rt"' in round_trip_text
+    for unsafe in ('typ="unsafe"', 'typ="base"', 'typ="full"', "FullLoader", "UnsafeLoader"):
+        assert unsafe not in round_trip_text
+
     forbidden = (".load(", ".full_load(", ".unsafe_load(", "FullLoader", "UnsafeLoader")
     for path, text in sources.items():
         for token in forbidden:

@@ -59,6 +59,10 @@ class Finding:
     reason: str
     confidence: float
     origin_node: str
+    #: False when the column is only *used* on the node (JOIN/WHERE) and is not
+    #: part of its output: such a finding says "PII was used here", not "this
+    #: column holds PII", so write-back never turns it into a column tag.
+    in_output: bool = True
 
 
 @dataclass

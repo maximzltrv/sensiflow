@@ -203,7 +203,7 @@ def test_outcome_echoes_policy_and_is_frozen() -> None:
     assert outcome.fail_on == "HIGH"
     assert outcome.min_confidence == 0.25
     with pytest.raises(dataclasses.FrozenInstanceError):
-        outcome.tripped = False  # type: ignore[misc]
+        outcome.tripped = False  # type: ignore[misc]  # frozen dataclass: assignment must raise
 
 
 def test_gate_does_not_mutate_engine_output() -> None:

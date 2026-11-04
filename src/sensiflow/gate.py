@@ -23,6 +23,31 @@ GateRisk = Literal["LOW", "MEDIUM", "HIGH"]
 _GATE_THRESHOLDS: frozenset[str] = frozenset({"LOW", "MEDIUM", "HIGH"})
 
 
+def validate_risk_threshold(value: str, label: str) -> None:
+    """Reject anything but LOW/MEDIUM/HIGH; ``label`` names the flag in the message.
+
+    Shared by the gate (``fail-on``) and write-back (``min-risk``): ORIGIN is a
+    declared seed and NONE would select everything — neither is a threshold.
+    """
+    if value not in _GATE_THRESHOLDS:
+        raise SensiflowInputError(
+            f"{label} threshold must be one of LOW, MEDIUM, HIGH — got {value!r}"
+        )
+
+
+def validate_min_confidence(value: float) -> None:
+    """Range-check the raw confidence threshold (NaN fails the chained comparison too)."""
+    if not 0.0 <= value <= 1.0:
+        raise SensiflowInputError(
+            f"min-confidence must be between 0.0 and 1.0 inclusive — got {value}"
+        )
+
+
+def meets_confidence(confidence: float, min_confidence: float) -> bool:
+    """The ADR-0004 A4 comparison: inclusive, both sides at the published 4 decimals."""
+    return round(confidence, 4) >= round(min_confidence, 4)
+
+
 @dataclass(frozen=True)
 class GateOutcome:
     """The result of evaluating a gate policy against a trace."""
@@ -52,15 +77,8 @@ def evaluate_gate(
     *suppressed*: collected (risk descending, then node name, then column),
     never silently dropped.
     """
-    if fail_on not in _GATE_THRESHOLDS:
-        raise SensiflowInputError(
-            f"fail-on threshold must be one of LOW, MEDIUM, HIGH — got {fail_on!r}"
-        )
-    # NaN fails every comparison, so the chained check also rejects it.
-    if not 0.0 <= min_confidence <= 1.0:
-        raise SensiflowInputError(
-            f"min-confidence must be between 0.0 and 1.0 inclusive — got {min_confidence}"
-        )
+    validate_risk_threshold(fail_on, "fail-on")
+    validate_min_confidence(min_confidence)
 
     threshold = RISK_RANK[fail_on]
     violations: list[NodeResult] = []
@@ -75,7 +93,7 @@ def evaluate_gate(
         for finding in node.findings.values():
             if RISK_RANK[finding.risk] < threshold:
                 continue
-            if round(finding.confidence, 4) >= round(min_confidence, 4):
+            if meets_confidence(finding.confidence, min_confidence):
                 gating = True
             else:
                 suppressed.append((node.name, node.node_id, finding))
