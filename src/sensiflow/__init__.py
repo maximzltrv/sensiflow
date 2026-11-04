@@ -7,6 +7,7 @@ from sensiflow.exceptions import (
     SensiflowError,
     SensiflowInputError,
 )
+from sensiflow.gate import GateOutcome, GateRisk, evaluate_gate
 from sensiflow.model import (
     Finding,
     LineageGraph,
@@ -23,6 +24,8 @@ __version__ = "0.1.0"
 __all__ = [
     "DEFAULT_GENERIC_COLUMNS",
     "Finding",
+    "GateOutcome",
+    "GateRisk",
     "GraphSelection",
     "LineageGraph",
     "Node",
@@ -35,5 +38,6 @@ __all__ = [
     "SensiflowInputError",
     "TraceResult",
     "__version__",
+    "evaluate_gate",
     "trace",
 ]

@@ -210,7 +210,7 @@ def test_duplicate_roots_resolve_to_one_node_on_dbt() -> None:
 def test_cli_empty_root_value_is_clean_error(capsys: pytest.CaptureFixture[str]) -> None:
     exit_code = main(["report", "--root", ""])
     err = capsys.readouterr().err
-    assert exit_code == 1
+    assert exit_code == 2
     assert err.startswith("error:")
     assert "non-empty" in err
 
@@ -218,7 +218,7 @@ def test_cli_empty_root_value_is_clean_error(capsys: pytest.CaptureFixture[str])
 def test_cli_depth_without_roots_is_clean_error(capsys: pytest.CaptureFixture[str]) -> None:
     exit_code = main(["report", "--upstream-depth", "2"])
     err = capsys.readouterr().err
-    assert exit_code == 1
+    assert exit_code == 2
     assert err.startswith("error:")
     assert "depths require roots" in err
 
@@ -230,7 +230,7 @@ def test_cli_pattern_matching_nothing_is_clean_error(
         ["report", "--source", "dbt", "--dbt-manifest", str(MANIFEST), "--root", "zzz_*"]
     )
     err = capsys.readouterr().err
-    assert exit_code == 1
+    assert exit_code == 2
     assert err.startswith("error:")
     assert "matched no tables" in err
 
@@ -238,7 +238,7 @@ def test_cli_pattern_matching_nothing_is_clean_error(
 def test_cli_missing_roots_file_is_clean_error(capsys: pytest.CaptureFixture[str]) -> None:
     exit_code = main(["report", "--roots-file", "/nowhere/roots.yaml"])
     err = capsys.readouterr().err
-    assert exit_code == 1
+    assert exit_code == 2
     assert err.startswith("error:")
     assert "roots file not found" in err
 
@@ -249,7 +249,7 @@ def test_cli_roots_file_excludes_roots_from_seeds(
     path = write_roots(tmp_path, "version: 1\nroots:\n  - id: raw_customers\n")
     exit_code = main(["report", "--roots-file", str(path), "--roots-from-seeds"])
     err = capsys.readouterr().err
-    assert exit_code == 1
+    assert exit_code == 2
     assert err.startswith("error:")
     assert "mutually exclusive" in err
 
@@ -260,7 +260,7 @@ def test_cli_invalid_roots_file_names_file_and_problem(
     path = write_roots(tmp_path, "version: 2\nroots:\n  - id: raw_customers\n")
     exit_code = main(["report", "--roots-file", str(path)])
     err = capsys.readouterr().err
-    assert exit_code == 1
+    assert exit_code == 2
     assert "roots.yaml" in err
     assert "unsupported roots-file version" in err
 

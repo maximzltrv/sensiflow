@@ -6,54 +6,63 @@ import argparse
 import json
 import os
 import sys
+import traceback
+from collections.abc import Callable
+from enum import IntEnum
 
 from sensiflow.engine import trace
-from sensiflow.exceptions import SensiflowError
-from sensiflow.report import render_json, render_text
+from sensiflow.exceptions import SensiflowError, SensiflowInputError
+from sensiflow.gate import evaluate_gate
+from sensiflow.model import TraceResult
+from sensiflow.report import render_check_json, render_check_text, render_json, render_text
 from sensiflow.root_selectors import GraphSelection, has_glob_chars, load_roots_file
 from sensiflow.sources.base import LineageSource
 from sensiflow.sources.mock import MockSource
 
 
-def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="sensiflow",
-        description="Propagate PII tags along data lineage and classify exposure risk.",
-    )
-    subparsers = parser.add_subparsers(dest="command", required=True)
+class ExitCode(IntEnum):
+    """Process exit contract, CLI-wide (ADR-0004 §1). Fixed; changes are major-version events."""
 
-    report = subparsers.add_parser("report", help="analyze lineage and print a risk report")
-    report.add_argument(
+    OK = 0  # run completed; nothing at or above the threshold
+    GATE_TRIPPED = 1  # `check` only; reserved exclusively for policy-gate trips
+    INPUT_ERROR = 2  # usage or invalid local input (argparse's native 2 aligns)
+    OPERATIONAL_ERROR = 3  # environment: catalog, missing extra, unexpected internal error
+
+
+_EXIT_CODE_EPILOG = (
+    "exit codes: 0 = clean pass, 1 = gate tripped (check only), "
+    "2 = usage/input error, 3 = operational error"
+)
+
+
+def _build_common_parser() -> argparse.ArgumentParser:
+    """Flags `report` and `check` share, defined once (ADR-0004 §3: no drift)."""
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
         "--source",
         choices=["mock", "openmetadata", "dbt"],
         default="mock",
         help="lineage source (default: the built-in mock graph)",
     )
-    report.add_argument(
-        "--format",
-        choices=["text", "json"],
-        default="text",
-        help="output format (default: text)",
-    )
-    report.add_argument(
+    common.add_argument(
         "--dialect",
         default="bigquery",
         help="SQL dialect for parsing transformation SQL (default: bigquery)",
     )
-    report.add_argument(
+    common.add_argument(
         "--omd-host",
         help="OpenMetadata host, e.g. http://localhost:8585 (or OMD_HOST env var)",
     )
-    report.add_argument(
+    common.add_argument(
         "--omd-token",
         help="OpenMetadata JWT token (or OMD_TOKEN env var; prefer the env var)",
     )
-    report.add_argument(
+    common.add_argument(
         "--dbt-manifest",
         metavar="PATH",
         help="path to a dbt manifest.json (required with --source dbt)",
     )
-    report.add_argument(
+    common.add_argument(
         "--root",
         action="append",
         dest="roots",
@@ -64,7 +73,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "omit for a full catalog scan"
         ),
     )
-    report.add_argument(
+    common.add_argument(
         "--roots-file",
         action="append",
         dest="roots_files",
@@ -74,7 +83,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "one occurrence; combines with --root as a union"
         ),
     )
-    report.add_argument(
+    common.add_argument(
         "--roots-from-seeds",
         action="store_true",
         help=(
@@ -82,15 +91,69 @@ def _build_parser() -> argparse.ArgumentParser:
             "--root and --roots-file"
         ),
     )
-    report.add_argument(
+    common.add_argument(
         "--upstream-depth",
         type=int,
         help="max hops upstream from the nearest root (0 disables; omit for unlimited)",
     )
-    report.add_argument(
+    common.add_argument(
         "--downstream-depth",
         type=int,
         help="max hops downstream from the nearest root (0 disables; omit for unlimited)",
+    )
+    return common
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="sensiflow",
+        description="Propagate PII tags along data lineage and classify exposure risk.",
+        epilog=_EXIT_CODE_EPILOG,
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    common = _build_common_parser()
+
+    report = subparsers.add_parser(
+        "report",
+        parents=[common],
+        help="analyze lineage and print a risk report",
+        epilog=_EXIT_CODE_EPILOG,
+    )
+    report.add_argument(
+        "--format",
+        choices=["text", "json"],
+        default="text",
+        help="output format (default: text)",
+    )
+
+    check = subparsers.add_parser(
+        "check",
+        parents=[common],
+        help="CI gate: exit 1 when PII exposure reaches the --fail-on threshold",
+        epilog=_EXIT_CODE_EPILOG,
+    )
+    check.add_argument(
+        "--fail-on",
+        type=str.upper,
+        choices=["LOW", "MEDIUM", "HIGH"],
+        required=True,
+        help="risk threshold that trips the gate (required; case-insensitive)",
+    )
+    check.add_argument(
+        "--min-confidence",
+        type=float,
+        default=0.0,
+        metavar="X",
+        help=(
+            "minimum finding confidence to gate on, 0.0-1.0 (default: 0.0 — "
+            "every finding gates); filtered findings are reported, never hidden"
+        ),
+    )
+    check.add_argument(
+        "--format",
+        choices=["text", "json"],
+        default="text",
+        help="output format (default: text)",
     )
     return parser
 
@@ -136,28 +199,89 @@ def _build_selection(args: argparse.Namespace) -> GraphSelection:
     )
 
 
+def _run_trace(parser: argparse.ArgumentParser, args: argparse.Namespace) -> TraceResult:
+    """The shared pipeline: source -> graph -> trace (identical for report and check)."""
+    source = _make_source(parser, args)
+    graph = source.build_graph(_build_selection(args))
+    return trace(graph, dialect=args.dialect)
+
+
+def _error_exit_code(exc: SensiflowError) -> ExitCode:
+    """Map library errors to the taxonomy: bad input is 2, everything else is 3."""
+    if isinstance(exc, SensiflowInputError):
+        return ExitCode.INPUT_ERROR
+    return ExitCode.OPERATIONAL_ERROR
+
+
+def _silence_stdout() -> None:
+    """Point fd 1 at devnull so interpreter shutdown cannot hit EPIPE again."""
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+    except (OSError, ValueError):
+        pass  # no real fd behind sys.stdout (e.g. captured in tests)
+
+
+def _guarded(compute: Callable[[], tuple[str, ExitCode]]) -> int:
+    """Run a command inside the CLI-wide error wrapper (ADR-0004 A1/A2).
+
+    ``compute`` returns the rendered document and the verdict code. Emitting the
+    document is part of the protected region: no failure path may exit 1.
+    """
+    verdict: ExitCode | None = None
+    try:
+        output, verdict = compute()
+        print(output, end="")
+        sys.stdout.flush()
+    except BrokenPipeError:
+        # The reader went away; nothing failed, so the computed verdict stands.
+        _silence_stdout()
+        return verdict if verdict is not None else ExitCode.OPERATIONAL_ERROR
+    except SensiflowError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return _error_exit_code(exc)
+    except Exception:
+        # Exit 1 is reserved for gate trips (ADR-0004 §1): an unexpected crash
+        # must never fake one. Full traceback on stderr, honest exit code.
+        traceback.print_exc(file=sys.stderr)
+        return ExitCode.OPERATIONAL_ERROR
+    return verdict
+
+
+def _run_report(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
+    def compute() -> tuple[str, ExitCode]:
+        result = _run_trace(parser, args)
+        if args.format == "json":
+            return json.dumps(render_json(result), indent=2) + "\n", ExitCode.OK
+        return render_text(result), ExitCode.OK
+
+    return _guarded(compute)
+
+
+def _run_check(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
+    def compute() -> tuple[str, ExitCode]:
+        result = _run_trace(parser, args)
+        outcome = evaluate_gate(result, fail_on=args.fail_on, min_confidence=args.min_confidence)
+        if args.format == "json":
+            output = json.dumps(render_check_json(result, outcome), indent=2) + "\n"
+        else:
+            output = render_check_text(result, outcome)
+        return output, ExitCode.GATE_TRIPPED if outcome.tripped else ExitCode.OK
+
+    return _guarded(compute)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
 
-    if args.command == "report":
-        if args.roots_files and len(args.roots_files) > 1:
-            # argparse would silently keep the last occurrence; reject instead.
-            parser.error("--roots-file may be given at most once")
+    if args.roots_files and len(args.roots_files) > 1:
+        # argparse would silently keep the last occurrence; reject instead.
+        parser.error("--roots-file may be given at most once")
 
-        source = _make_source(parser, args)
-        try:
-            graph = source.build_graph(_build_selection(args))
-        except SensiflowError as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            return 1
-
-        result = trace(graph, dialect=args.dialect)
-        if args.format == "json":
-            print(json.dumps(render_json(result), indent=2))
-        else:
-            print(render_text(result), end="")
-    return 0
+    if args.command == "check":
+        return _run_check(parser, args)
+    return _run_report(parser, args)
 
 
 if __name__ == "__main__":

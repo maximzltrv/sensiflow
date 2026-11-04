@@ -81,6 +81,40 @@ def make_source(handler: Any = _handler) -> OpenMetadataSource:
     )
 
 
+def test_host_with_embedded_credentials_is_rejected_without_echo() -> None:
+    with pytest.raises(SensiflowInputError) as excinfo:
+        OpenMetadataSource("http://svc_user:s3cret_pw@omd.test:8585", TOKEN)
+    message = str(excinfo.value)
+    assert "OMD_TOKEN" in message
+    assert "svc_user" not in message
+    assert "s3cret_pw" not in message
+
+
+def test_schemeless_host_with_credentials_is_rejected_without_echo() -> None:
+    with pytest.raises(SensiflowInputError) as excinfo:
+        OpenMetadataSource("svc_user:s3cret_pw@omd.test:8585", TOKEN)
+    message = str(excinfo.value)
+    assert "http://" in message
+    assert "s3cret_pw" not in message
+    assert "svc_user" not in message
+    assert "omd.test" not in message
+
+
+@pytest.mark.parametrize("host", ["omd.test:8585", "//omd.test", "ftp://omd.test", ""])
+def test_host_without_http_scheme_is_rejected(host: str) -> None:
+    with pytest.raises(SensiflowInputError, match="must start with http:// or https://"):
+        OpenMetadataSource(host, TOKEN)
+
+
+@pytest.mark.parametrize("host", ["http://omd.test", "https://omd.test:8585", "HTTPS://omd.test"])
+def test_http_and_https_hosts_are_accepted(host: str) -> None:
+    assert OpenMetadataSource(host, TOKEN).host == host
+
+
+def test_host_without_userinfo_is_accepted() -> None:
+    assert OpenMetadataSource("http://omd.test:8585/", TOKEN).host == "http://omd.test:8585"
+
+
 # --- full scan ---------------------------------------------------------------
 
 
